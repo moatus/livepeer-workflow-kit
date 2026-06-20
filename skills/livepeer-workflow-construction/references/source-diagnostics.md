@@ -36,10 +36,20 @@ The stock browser extension uses WSS custom signaling servers. Use the TLS bridg
 
 ## Browser Capture Setup
 
-For a browser tab, webinar, or screenshare source, two things must be true before a workflow can capture media:
+For a browser tab, webinar, or screenshare source, the local ingest bridge complements the browser extension. The extension publishes the tab/call into the bridge; the workflow consumes the bridge stream.
+
+Chrome extension:
+
+```text
+https://chromewebstore.google.com/detail/vdoninja-video-capture/hppndmepdhaplfamkeblnhpjmiigcdij
+```
+
+Two things must be true before a workflow can capture media:
 
 1. The VDO signaling bridge container must be running and reachable on the host.
-2. The browser must publish to that bridge, typically through the Chrome extension from the Chrome Web Store with its custom signaling server set to `wss://localhost:9443`.
+2. The browser must publish to that bridge, typically through the Chrome extension with its custom signaling server set to `wss://localhost:9443`.
+
+If the user wants to capture a browser tab but has not installed or enabled the extension, tell them to install the extension above and set its custom signaling server to `wss://localhost:9443`.
 
 The workflow does not capture directly from Chrome. It captures a stream registered on the bridge. If the user says a browser/webinar stream is running, verify the bridge state rather than assuming the extension is connected.
 
