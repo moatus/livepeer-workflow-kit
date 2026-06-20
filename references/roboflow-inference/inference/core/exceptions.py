@@ -1,0 +1,298 @@
+from typing import Optional
+
+
+class ContentTypeInvalid(Exception):
+    """Raised when the content type is invalid.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class ContentTypeMissing(Exception):
+    """Raised when the content type is missing.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class EngineIgnitionFailure(Exception):
+    """Raised when the engine fails to ignite.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class InferenceModelNotFound(Exception):
+    """Raised when the inference model is not found.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class InvalidEnvironmentVariableError(Exception):
+    """Raised when an environment variable is invalid.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class InvalidMaskDecodeArgument(Exception):
+    """Raised when an invalid argument is provided for mask decoding.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class MissingApiKeyError(Exception):
+    """Raised when the API key is missing.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class MissingServiceSecretError(Exception):
+    """Raised when the service secret is missing.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class OnnxProviderNotAvailable(Exception):
+    """Raised when the ONNX provider is not available.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class WorkspaceLoadError(Exception):
+    """Raised when there is an error loading the workspace.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class InputImageLoadError(Exception):
+
+    def __init__(self, message: str, public_message: str):
+        super().__init__(message)
+        self._public_message = public_message
+
+    def get_public_error_details(self) -> str:
+        return self._public_message
+
+
+class InvalidNumpyInput(InputImageLoadError):
+    """Raised when the input is an invalid NumPy array.
+
+    Attributes:
+        message (str): Optional message describing the error.
+    """
+
+
+class InvalidImageTypeDeclared(InputImageLoadError):
+    pass
+
+
+class InputFormatInferenceFailed(InputImageLoadError):
+    pass
+
+
+class PreProcessingError(Exception):
+    pass
+
+
+class PostProcessingError(Exception):
+    pass
+
+
+class InvalidModelIDError(Exception):
+    pass
+
+
+class MalformedRoboflowAPIResponseError(Exception):
+    pass
+
+
+class ServiceConfigurationError(Exception):
+    pass
+
+
+class ModelDeploymentNotSupportedError(ServiceConfigurationError):
+    pass
+
+
+class MissingDefaultModelError(ServiceConfigurationError):
+    pass
+
+
+class ModelNotRecognisedError(ServiceConfigurationError):
+    pass
+
+
+class RoboflowAPIRequestError(Exception):
+    pass
+
+
+class ModelManagerLockAcquisitionError(RoboflowAPIRequestError):
+    pass
+
+
+class RoboflowAPIUnsuccessfulRequestError(RoboflowAPIRequestError):
+    pass
+
+
+class RoboflowAPINotAuthorizedError(RoboflowAPIUnsuccessfulRequestError):
+    pass
+
+
+class PaymentRequiredError(RoboflowAPIUnsuccessfulRequestError):
+    pass
+
+
+class RoboflowAPIForbiddenError(RoboflowAPIUnsuccessfulRequestError):
+    pass
+
+
+class RoboflowAPIUsagePausedError(RoboflowAPIUnsuccessfulRequestError):
+    pass
+
+
+class RoboflowAPINotNotFoundError(RoboflowAPIUnsuccessfulRequestError):
+    pass
+
+
+class RoboflowAPIConnectionError(RoboflowAPIRequestError):
+    pass
+
+
+class RoboflowAPITimeoutError(RoboflowAPIRequestError):
+    pass
+
+
+class RoboflowAPIImageUploadRejectionError(RoboflowAPIRequestError):
+    pass
+
+
+class RoboflowAPIIAnnotationRejectionError(RoboflowAPIRequestError):
+    pass
+
+
+class MalformedWorkflowResponseError(RoboflowAPIRequestError):
+    pass
+
+
+class RoboflowAPIIAlreadyAnnotatedError(RoboflowAPIIAnnotationRejectionError):
+    pass
+
+
+class ModelArtefactError(Exception):
+    pass
+
+
+class ActiveLearningError(Exception):
+    pass
+
+
+class PredictionFormatNotSupported(ActiveLearningError):
+    pass
+
+
+class ActiveLearningConfigurationDecodingError(ActiveLearningError):
+    pass
+
+
+class ActiveLearningConfigurationError(ActiveLearningError):
+    pass
+
+
+class CannotInitialiseModelError(Exception):
+    pass
+
+
+class CannotInitialiseModelDueToInputSizeError(CannotInitialiseModelError):
+    pass
+
+
+class RetryRequestError(Exception):
+
+    def __init__(self, message: str, inner_error: Exception):
+        super().__init__(message)
+        self._inner_error = inner_error
+
+    @property
+    def inner_error(self) -> Exception:
+        return self._inner_error
+
+
+class WebRTCConfigurationError(Exception):
+    pass
+
+
+class CreditsExceededError(Exception):
+    pass
+
+
+class WorkspaceStreamQuotaError(Exception):
+    """Raised when the workspace stream quota has been exceeded.
+
+    This error is returned when a workspace has reached its maximum number
+    of concurrent WebRTC streams. This is to prevent that a single user
+    uses all our modal resources.
+    """
+
+    pass
+
+
+class FeatureDeprecatedError(Exception):
+    """Raised when a removed/deprecated feature is invoked.
+
+    Maps to HTTP 410 Gone via the standard error handler; surfaces as
+    error_type="FeatureDeprecatedError" in InferencePipeline StatusUpdate
+    payloads and as the inner_error of
+    ClientCausedStepExecutionError(status_code=410) when raised from a
+    workflow block.
+    """
+
+    def __init__(
+        self,
+        feature: str,
+        *,
+        removal_release: Optional[str] = None,
+        replacement: Optional[str] = None,
+        reason: Optional[str] = None,
+    ):
+        self.feature = feature
+        self.removal_release = removal_release
+        self.replacement = replacement
+        self.reason = reason
+        public = f"Feature '{feature}' has been removed from inference."
+        if reason:
+            public += f" Reason: {reason}."
+        if removal_release:
+            public += f" Removed in {removal_release}."
+        public += (
+            " No drop-in replacement is provided; contact Roboflow if you "
+            "require this capability."
+        )
+        if replacement:
+            public += f" Closest replacement: {replacement}."
+        self._public_message = public
+        super().__init__(public)
+
+    def get_structured_public_error_details(self) -> dict:
+        return {
+            "feature": self.feature,
+            "removal_release": self.removal_release,
+            "replacement": self.replacement,
+            "reason": self.reason,
+        }

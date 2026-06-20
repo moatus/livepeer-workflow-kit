@@ -1,0 +1,1320 @@
+import asyncio
+import base64
+import binascii
+import hashlib
+import json
+import os
+import re
+import time
+import urllib.parse
+from dataclasses import dataclass
+from enum import Enum
+from hashlib import sha256
+from json import JSONDecodeError
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+
+import aiohttp
+import backoff
+import requests
+from cachetools.func import ttl_cache
+from requests import Response, Timeout
+from requests_toolbelt import MultipartEncoder
+from yarl import URL
+
+from inference.core import logger
+from inference.core.cache import cache
+from inference.core.cache.base import BaseCache
+from inference.core.cache.model_artifacts import get_cache_dir, initialise_cache
+from inference.core.entities.types import (
+    DatasetID,
+    ModelID,
+    ModelType,
+    TaskType,
+    VersionID,
+    WorkspaceID,
+)
+from inference.core.env import (
+    API_BASE_URL,
+    ENFORCE_CREDITS_VERIFICATION,
+    GCP_SERVERLESS,
+    INTERNAL_WEIGHTS_URL_SUFFIX,
+    MD5_VERIFICATION_ENABLED,
+    MODEL_CACHE_DIR,
+    MODELS_CACHE_AUTH_CACHE_MAX_SIZE,
+    MODELS_CACHE_AUTH_CACHE_TTL,
+    MODELS_CACHE_AUTH_ENABLED,
+    RETRY_CONNECTION_ERRORS_TO_ROBOFLOW_API,
+    ROBOFLOW_API_EXTRA_HEADERS,
+    ROBOFLOW_API_REQUEST_TIMEOUT,
+    ROBOFLOW_API_VERIFY_SSL,
+    ROBOFLOW_INTERNAL_SERVICE_SECRET,
+    ROBOFLOW_SERVICE_SECRET,
+    SINGLE_TENANT_WORKFLOW_CACHE,
+    TRANSIENT_ROBOFLOW_API_ERRORS,
+    TRANSIENT_ROBOFLOW_API_ERRORS_RETRIES,
+    TRANSIENT_ROBOFLOW_API_ERRORS_RETRY_INTERVAL,
+    USE_FILE_CACHE_FOR_WORKFLOWS_DEFINITIONS,
+    WORKFLOWS_DEFINITION_CACHE_EXPIRY,
+)
+from inference.core.exceptions import (
+    MalformedRoboflowAPIResponseError,
+    MalformedWorkflowResponseError,
+    MissingDefaultModelError,
+    PaymentRequiredError,
+    RetryRequestError,
+    RoboflowAPIConnectionError,
+    RoboflowAPIForbiddenError,
+    RoboflowAPIIAlreadyAnnotatedError,
+    RoboflowAPIIAnnotationRejectionError,
+    RoboflowAPIImageUploadRejectionError,
+    RoboflowAPINotAuthorizedError,
+    RoboflowAPINotNotFoundError,
+    RoboflowAPITimeoutError,
+    RoboflowAPIUnsuccessfulRequestError,
+    RoboflowAPIUsagePausedError,
+    WorkspaceLoadError,
+)
+from inference.core.telemetry import record_api_call, record_error, start_span
+from inference.core.utils.file_system import sanitize_path_segment
+from inference.core.utils.requests import (
+    api_key_safe_raise_for_status,
+    api_key_safe_raise_for_status_aiohttp,
+)
+from inference.core.utils.url_utils import wrap_url
+from inference.core.version import __version__
+
+LOCAL_API_KEY = "local"
+
+ENFORCE_CREDITS_VERIFICATION_HEADER = "x-enforce-credits-verification"
+ENFORCE_INTERNAL_ARTIFACTS_URLS_HEADER = "x-enforce-internal-artefacts-urls"
+
+MODEL_TYPE_DEFAULTS = {
+    "object-detection": "yolov5v2s",
+    "instance-segmentation": "yolact",
+    "classification": "vit",
+    "keypoint-detection": "yolov8n",
+}
+PROJECT_TASK_TYPE_KEY = "project_task_type"
+MODEL_TYPE_KEY = "model_type"
+
+NOT_FOUND_ERROR_MESSAGE = (
+    "Could not find requested Roboflow resource. Check that the provided dataset and "
+    "version are correct, and check that the provided Roboflow API key has the correct permissions."
+)
+
+ROBOFLOW_INFERENCE_VERSION_HEADER = "X-Roboflow-Inference-Version"
+ALLOW_CHUNKED_RESPONSE_HEADER = "X-Allow-Chunked"
+
+
+@dataclass(frozen=True)
+class ServerlessUsageCheckResponse:
+    status_code: int
+    workspace_id: Optional[WorkspaceID] = None
+    under_cap: Optional[bool] = None
+    error: Optional[str] = None
+
+
+def raise_from_lambda(
+    inner_error: Exception, exception_type: Type[Exception], message: str
+) -> None:
+    raise exception_type(message) from inner_error
+
+
+DEFAULT_ERROR_HANDLERS = {
+    401: lambda e: raise_from_lambda(
+        e,
+        RoboflowAPINotAuthorizedError,
+        "Unauthorized access to roboflow API - check API key. Visit "
+        "https://docs.roboflow.com/api-reference/authentication#retrieve-an-api-key to learn how to retrieve one.",
+    ),
+    402: lambda e: raise_from_lambda(
+        e,
+        PaymentRequiredError,
+        "Not enough credits to perform this request. Verify your workspace billing page.",
+    ),
+    403: lambda e: raise_from_lambda(
+        e,
+        RoboflowAPIForbiddenError,
+        "Unauthorized access to roboflow API - check API key regarding correctness and required scopes. Visit "
+        "https://docs.roboflow.com/api-reference/authentication#retrieve-an-api-key to learn how to retrieve one.",
+    ),
+    404: lambda e: raise_from_lambda(
+        e, RoboflowAPINotNotFoundError, NOT_FOUND_ERROR_MESSAGE
+    ),
+    423: lambda e: raise_from_lambda(
+        e,
+        RoboflowAPIUsagePausedError,
+        "Roboflow API usage is paused. Please contact your workspace administrator to re-enable api keys.",
+    ),
+}
+
+
+def wrap_roboflow_api_errors(
+    http_errors_handlers: Optional[
+        Dict[int, Callable[[Union[requests.exceptions.HTTPError]], None]]
+    ] = None,
+) -> callable:
+    def decorator(function: callable) -> callable:
+        def wrapper(*args, **kwargs) -> Any:
+            t_start = time.perf_counter()
+            with start_span(
+                "roboflow_api.call",
+                {"roboflow_api.function": function.__name__},
+            ):
+                try:
+                    try:
+                        return function(*args, **kwargs)
+                    except RetryRequestError as error:
+                        raise error.inner_error
+                except Timeout as error:
+                    record_error(error)
+                    raise RoboflowAPITimeoutError(
+                        "Timeout when attempting to connect to Roboflow API."
+                    ) from error
+                except (
+                    requests.exceptions.ConnectionError,
+                    ConnectionError,
+                ) as error:
+                    record_error(error)
+                    raise RoboflowAPIConnectionError(
+                        "Could not connect to Roboflow API."
+                    ) from error
+                except requests.exceptions.HTTPError as error:
+                    record_error(error)
+                    user_handler_override = (
+                        http_errors_handlers if http_errors_handlers is not None else {}
+                    )
+                    status_code = error.response.status_code
+                    default_handler = DEFAULT_ERROR_HANDLERS.get(status_code)
+                    error_handler = user_handler_override.get(
+                        status_code, default_handler
+                    )
+                    if error_handler is not None:
+                        error_handler(error)
+                    raise RoboflowAPIUnsuccessfulRequestError(
+                        f"Unsuccessful request to Roboflow API with response code: {status_code}"
+                    ) from error
+                except requests.exceptions.InvalidJSONError as error:
+                    record_error(error)
+                    raise MalformedRoboflowAPIResponseError(
+                        "Could not decode JSON response from Roboflow API."
+                    ) from error
+                finally:
+                    record_api_call(function.__name__, time.perf_counter() - t_start)
+
+        return wrapper
+
+    return decorator
+
+
+def wrap_roboflow_api_errors_async(
+    http_errors_handlers: Optional[
+        Dict[int, Callable[[Union[aiohttp.ClientError]], None]]
+    ] = None,
+) -> callable:
+    def decorator(function: callable) -> callable:
+        async def wrapper(*args, **kwargs) -> Any:
+            t_start = time.perf_counter()
+            with start_span(
+                "roboflow_api.call",
+                {"roboflow_api.function": function.__name__},
+            ):
+                try:
+                    try:
+                        return await function(*args, **kwargs)
+                    except RetryRequestError as error:
+                        raise error.inner_error
+                except asyncio.TimeoutError as error:
+                    record_error(error)
+                    raise RoboflowAPITimeoutError(
+                        "Timeout when attempting to connect to Roboflow API."
+                    ) from error
+                except (aiohttp.ClientConnectionError, ConnectionError) as error:
+                    record_error(error)
+                    raise RoboflowAPIConnectionError(
+                        "Could not connect to Roboflow API."
+                    ) from error
+                except (aiohttp.ContentTypeError, JSONDecodeError) as error:
+                    record_error(error)
+                    raise MalformedRoboflowAPIResponseError(
+                        "Could not decode JSON response from Roboflow API."
+                    ) from error
+                except aiohttp.ClientResponseError as error:
+                    record_error(error)
+                    user_handler_override = (
+                        http_errors_handlers if http_errors_handlers is not None else {}
+                    )
+                    status_code = error.status
+                    default_handler = DEFAULT_ERROR_HANDLERS.get(status_code)
+                    error_handler = user_handler_override.get(
+                        status_code, default_handler
+                    )
+                    if error_handler is not None:
+                        error_handler(error)
+                    raise RoboflowAPIUnsuccessfulRequestError(
+                        f"Unsuccessful request to Roboflow API with response code: {status_code}"
+                    ) from error
+                # remaining aiohttp.ClientError seems to qualify to simply pass-through raise
+                finally:
+                    record_api_call(function.__name__, time.perf_counter() - t_start)
+
+        return wrapper
+
+    return decorator
+
+
+@ttl_cache(ttl=MODELS_CACHE_AUTH_CACHE_TTL, maxsize=MODELS_CACHE_AUTH_CACHE_MAX_SIZE)
+@wrap_roboflow_api_errors()
+def get_roboflow_workspace(api_key: str) -> WorkspaceID:
+    if not api_key:
+        raise WorkspaceLoadError("Empty workspace encountered, check your API key.")
+
+    api_url = _add_params_to_url(
+        url=f"{API_BASE_URL}/",
+        params=[("api_key", api_key), ("nocache", "true")],
+    )
+    api_key_info = _get_from_url(url=api_url)
+    workspace_id = api_key_info.get("workspace")
+    if workspace_id is None:
+        raise WorkspaceLoadError("Empty workspace encountered, check your API key.")
+    return workspace_id
+
+
+@wrap_roboflow_api_errors_async()
+@backoff.on_exception(
+    backoff.constant,
+    exception=RetryRequestError,
+    max_tries=TRANSIENT_ROBOFLOW_API_ERRORS_RETRIES,
+    interval=TRANSIENT_ROBOFLOW_API_ERRORS_RETRY_INTERVAL,
+)
+async def get_roboflow_workspace_async(api_key: str) -> WorkspaceID:
+    try:
+        headers = build_roboflow_api_headers()
+        full_url = wrap_url(
+            _add_params_to_url(
+                url=f"{API_BASE_URL}/",
+                params=[("api_key", api_key), ("nocache", "true")],
+            )
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                URL(full_url, encoded=True),
+                headers=headers,
+                timeout=ROBOFLOW_API_REQUEST_TIMEOUT,
+            ) as response:
+                try:
+                    api_key_safe_raise_for_status_aiohttp(response=response)
+                except Exception as error:
+                    if response.status in TRANSIENT_ROBOFLOW_API_ERRORS:
+                        raise RetryRequestError(
+                            message=str(error), inner_error=error
+                        ) from error
+                    raise error
+                response_payload = await response.json()
+                workspace_id = response_payload.get("workspace")
+                if workspace_id is None:
+                    raise WorkspaceLoadError(
+                        "Empty workspace encountered, check your API key."
+                    )
+                return workspace_id
+    except (aiohttp.ClientConnectionError, ConnectionError) as error:
+        if RETRY_CONNECTION_ERRORS_TO_ROBOFLOW_API:
+            raise RetryRequestError(
+                message="Connectivity error", inner_error=error
+            ) from error
+        raise error
+
+
+@wrap_roboflow_api_errors_async()
+@backoff.on_exception(
+    backoff.constant,
+    exception=RetryRequestError,
+    max_tries=TRANSIENT_ROBOFLOW_API_ERRORS_RETRIES,
+    interval=TRANSIENT_ROBOFLOW_API_ERRORS_RETRY_INTERVAL,
+)
+async def get_serverless_usage_check_async(
+    api_key: str,
+) -> ServerlessUsageCheckResponse:
+    try:
+        headers = build_roboflow_api_headers()
+        full_url = wrap_url(
+            _add_params_to_url(
+                url=f"{API_BASE_URL}/serverless/usage-check",
+                params=[("api_key", api_key), ("nocache", "true")],
+            )
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                URL(full_url, encoded=True),
+                headers=headers,
+                timeout=ROBOFLOW_API_REQUEST_TIMEOUT,
+            ) as response:
+                if response.status == 401:
+                    return ServerlessUsageCheckResponse(status_code=401)
+                if response.status == 402:
+                    response_payload = await response.json()
+                    workspace = response_payload.get(
+                        "workspace"
+                    ) or response_payload.get("workspaceId")
+                    return ServerlessUsageCheckResponse(
+                        status_code=402,
+                        workspace_id=workspace,
+                        under_cap=response_payload.get("underCap"),
+                        error=response_payload.get("error"),
+                    )
+                try:
+                    api_key_safe_raise_for_status_aiohttp(response=response)
+                except Exception as error:
+                    if response.status in TRANSIENT_ROBOFLOW_API_ERRORS:
+                        raise RetryRequestError(
+                            message=str(error), inner_error=error
+                        ) from error
+                    raise error
+                response_payload = await response.json()
+                workspace_id = response_payload.get(
+                    "workspace"
+                ) or response_payload.get("workspaceId")
+                if workspace_id is None or response_payload.get("underCap") is not True:
+                    raise WorkspaceLoadError(
+                        "Unexpected serverless usage-check response received from Roboflow API."
+                    )
+                return ServerlessUsageCheckResponse(
+                    status_code=200,
+                    workspace_id=workspace_id,
+                    under_cap=True,
+                )
+    except (aiohttp.ClientConnectionError, ConnectionError) as error:
+        if RETRY_CONNECTION_ERRORS_TO_ROBOFLOW_API:
+            raise RetryRequestError(
+                message="Connectivity error", inner_error=error
+            ) from error
+        raise error
+
+
+@wrap_roboflow_api_errors()
+def add_custom_metadata(
+    api_key: str,
+    workspace_id: WorkspaceID,
+    inference_ids: List[str],
+    field_name: str,
+    field_value: str,
+):
+    api_url = wrap_url(
+        _add_params_to_url(
+            url=f"{API_BASE_URL}/{workspace_id}/inference-stats/metadata",
+            params=[("api_key", api_key), ("nocache", "true")],
+        )
+    )
+    response = requests.post(
+        url=api_url,
+        json={
+            "data": [
+                {
+                    "inference_ids": inference_ids,
+                    "field_name": field_name,
+                    "field_value": field_value,
+                }
+            ]
+        },
+        headers=build_roboflow_api_headers(),
+        timeout=ROBOFLOW_API_REQUEST_TIMEOUT,
+        verify=ROBOFLOW_API_VERIFY_SSL,
+    )
+    api_key_safe_raise_for_status(response=response)
+
+
+@wrap_roboflow_api_errors()
+def get_roboflow_dataset_type(
+    api_key: str, workspace_id: WorkspaceID, dataset_id: DatasetID
+) -> TaskType:
+    api_url = _add_params_to_url(
+        url=f"{API_BASE_URL}/{workspace_id}/{dataset_id}",
+        params=[("api_key", api_key), ("nocache", "true")],
+    )
+    dataset_info = _get_from_url(url=api_url)
+    project_task_type = dataset_info.get("project", {})
+    if "type" not in project_task_type:
+        logger.warning(
+            f"Project task type not defined for workspace={workspace_id} and dataset={dataset_id}, defaulting "
+            f"to object-detection."
+        )
+    return project_task_type.get("type", "object-detection")
+
+
+@wrap_roboflow_api_errors(
+    http_errors_handlers={
+        500: lambda e: raise_from_lambda(
+            e, RoboflowAPINotNotFoundError, NOT_FOUND_ERROR_MESSAGE
+        )
+        # this is temporary solution, empirically checked that backend API responds HTTP 500 on incorrect version.
+        # TO BE FIXED at backend, otherwise this error handling may overshadow existing backend problems.
+    }
+)
+def get_roboflow_model_type(
+    api_key: str,
+    workspace_id: WorkspaceID,
+    dataset_id: DatasetID,
+    version_id: VersionID,
+    project_task_type: ModelType,
+) -> ModelType:
+    api_url = _add_params_to_url(
+        url=f"{API_BASE_URL}/{workspace_id}/{dataset_id}/{version_id}",
+        params=[("api_key", api_key), ("nocache", "true")],
+    )
+    version_info = _get_from_url(url=api_url)
+    model_type = version_info["version"]
+    if "modelType" not in model_type:
+        if project_task_type not in MODEL_TYPE_DEFAULTS:
+            raise MissingDefaultModelError(
+                f"Could not set default model for {project_task_type}"
+            )
+        logger.warning(
+            f"Model type not defined - using default for {project_task_type} task."
+        )
+    return model_type.get("modelType", MODEL_TYPE_DEFAULTS[project_task_type])
+
+
+class ModelEndpointType(Enum):
+    ORT = "ort"
+    CORE_MODEL = "core_model"
+    OWLV2 = "owlv2"
+
+
+@wrap_roboflow_api_errors()
+def get_roboflow_model_data(
+    api_key: str,
+    model_id: str,
+    endpoint_type: ModelEndpointType,
+    device_id: str,
+    countinference: Optional[bool] = None,
+    service_secret: Optional[str] = None,
+) -> dict:
+    api_data_cache_key = f"roboflow_api_data:{endpoint_type.value}:{model_id}"
+    api_data = None
+    if not MODELS_CACHE_AUTH_ENABLED:
+        api_data = cache.get(api_data_cache_key)
+    if api_data is not None:
+        logger.debug(f"Loaded model data from cache with key: {api_data_cache_key}.")
+        return api_data
+    else:
+        params = [
+            ("nocache", "true"),
+            ("device", device_id),
+            ("dynamic", "true"),
+        ]
+        if api_key is not None and api_key != LOCAL_API_KEY:
+            params.append(("api_key", api_key))
+
+        if (
+            INTERNAL_WEIGHTS_URL_SUFFIX == "serverless"
+            and countinference is False
+            and service_secret == ROBOFLOW_SERVICE_SECRET
+        ):
+            params.append(("countinference", str(countinference).lower()))
+            params.append(("service_secret", service_secret))
+
+        api_base_url = urllib.parse.urljoin(API_BASE_URL, INTERNAL_WEIGHTS_URL_SUFFIX)
+        api_url = _add_params_to_url(
+            url=f"{api_base_url}/{endpoint_type.value}/{model_id}",
+            params=params,
+        )
+        api_data = _get_from_url(url=api_url)
+        cache.set(
+            api_data_cache_key,
+            api_data,
+            expire=10,
+        )
+        logger.debug(
+            f"Loaded model data from Roboflow API and saved to cache with key: {api_data_cache_key}."
+        )
+        return api_data
+
+
+@wrap_roboflow_api_errors()
+def get_roboflow_instant_model_data(
+    api_key: str,
+    model_id: ModelID,
+    cache_prefix: str = "roboflow_api_data",
+    countinference: Optional[bool] = None,
+    service_secret: Optional[str] = None,
+) -> dict:
+    api_data_cache_key = f"{cache_prefix}:{model_id}"
+    api_data = None
+    if not MODELS_CACHE_AUTH_ENABLED:
+        api_data = cache.get(api_data_cache_key)
+    if api_data is not None:
+        logger.debug(f"Loaded model data from cache with key: {api_data_cache_key}.")
+        return api_data
+    else:
+        params = [
+            ("model", model_id),
+        ]
+        if api_key is not None and api_key != LOCAL_API_KEY:
+            params.append(("api_key", api_key))
+
+        if (
+            INTERNAL_WEIGHTS_URL_SUFFIX == "serverless"
+            and countinference is False
+            and service_secret == ROBOFLOW_SERVICE_SECRET
+        ):
+            params.append(("countinference", str(countinference).lower()))
+            params.append(("service_secret", service_secret))
+
+        api_base_url = urllib.parse.urljoin(API_BASE_URL, INTERNAL_WEIGHTS_URL_SUFFIX)
+        api_url = _add_params_to_url(
+            url=f"{api_base_url}/getWeights",
+            params=params,
+        )
+        api_data = _get_from_url(url=api_url)
+        cache.set(
+            api_data_cache_key,
+            api_data,
+            expire=10,
+        )
+        logger.debug(
+            f"Loaded model data from Roboflow API and saved to cache with key: {api_data_cache_key}."
+        )
+        return api_data
+
+
+@wrap_roboflow_api_errors()
+def get_model_metadata_from_inference_models_registry(
+    api_key: str,
+    model_id: ModelID,
+    cache_prefix: str = "roboflow_api_data:inference_models_registry",
+    countinference: Optional[bool] = None,
+    service_secret: Optional[str] = None,
+) -> dict:
+    # Watch out - this function should only be used to substitute get_roboflow_instant_model_data()
+    # and only in terms of getting model type and task type
+    # this is only stub to make sure auth works as it should for models which are not
+    # associated to project via version (for which old auth and metadata retrieval method work).
+    api_data_cache_key = f"{cache_prefix}:{model_id}"
+    api_data = None
+    if not MODELS_CACHE_AUTH_ENABLED:
+        api_data = cache.get(api_data_cache_key)
+    if api_data is not None:
+        logger.debug(f"Loaded model data from cache with key: {api_data_cache_key}.")
+        return api_data
+    query = [("modelId", model_id)]
+    headers = {"Authorization": f"Bearer {api_key}"}
+    if GCP_SERVERLESS:
+        headers[ENFORCE_INTERNAL_ARTIFACTS_URLS_HEADER] = "true"
+    if ENFORCE_CREDITS_VERIFICATION:
+        skip = (
+            countinference is False
+            and service_secret is not None
+            and service_secret == ROBOFLOW_SERVICE_SECRET
+        )
+        if not skip:
+            headers[ENFORCE_CREDITS_VERIFICATION_HEADER] = "true"
+    if ROBOFLOW_INTERNAL_SERVICE_SECRET:
+        headers["X-Roboflow-Internal-Service-Secret"] = ROBOFLOW_INTERNAL_SERVICE_SECRET
+    api_url = _add_params_to_url(
+        url=f"{API_BASE_URL}/models/v1/external/weights",
+        params=query,
+    )
+    raw_api_data = _get_from_url(url=api_url, headers=headers)
+    api_data = {
+        "modelType": raw_api_data["modelMetadata"]["modelArchitecture"],
+        "taskType": raw_api_data["modelMetadata"]["taskType"],
+    }
+    cache.set(
+        api_data_cache_key,
+        api_data,
+        expire=10,
+    )
+    logger.debug(
+        f"Loaded model data from Roboflow API (inference-models registry) "
+        f"and saved to cache with key: {api_data_cache_key}."
+    )
+    return api_data
+
+
+@wrap_roboflow_api_errors()
+def get_roboflow_base_lora(
+    api_key: str, repo: str, revision: str, device_id: str
+) -> dict:
+    full_path = f"{repo.strip('/')}/{revision.strip('/')}"
+    api_data_cache_key = f"roboflow_api_data:lora-bases:{full_path}"
+    api_data = None
+    if not MODELS_CACHE_AUTH_ENABLED:
+        api_data = cache.get(api_data_cache_key)
+    if api_data is not None:
+        logger.debug(f"Loaded model data from cache with key: {api_data_cache_key}.")
+        return api_data
+    else:
+        params = [
+            ("nocache", "true"),
+            ("device", device_id),
+            ("repoAndRevision", full_path),
+        ]
+        if api_key is not None and api_key != LOCAL_API_KEY:
+            params.append(("api_key", api_key))
+        api_url = _add_params_to_url(
+            url=f"{API_BASE_URL}/lora_bases",
+            params=params,
+        )
+        api_data = _get_from_url(url=api_url)
+        cache.set(
+            api_data_cache_key,
+            api_data,
+            expire=10,
+        )
+        logger.debug(
+            f"Loaded lora base model data from Roboflow API and saved to cache with key: {api_data_cache_key}."
+        )
+        return api_data
+
+
+@wrap_roboflow_api_errors()
+def get_roboflow_active_learning_configuration(
+    api_key: str,
+    workspace_id: WorkspaceID,
+    dataset_id: DatasetID,
+) -> dict:
+    api_url = _add_params_to_url(
+        url=f"{API_BASE_URL}/{workspace_id}/{dataset_id}/active_learning",
+        params=[("api_key", api_key)],
+    )
+    return _get_from_url(url=api_url)
+
+
+@wrap_roboflow_api_errors()
+def register_image_at_roboflow(
+    api_key: str,
+    dataset_id: DatasetID,
+    local_image_id: str,
+    image_bytes: bytes,
+    batch_name: str,
+    tags: Optional[List[str]] = None,
+    inference_id: Optional[str] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> dict:
+    url = f"{API_BASE_URL}/dataset/{dataset_id}/upload"
+    params = [
+        ("api_key", api_key),
+        ("batch", batch_name),
+    ]
+    if inference_id is not None:
+        params.append(("inference_id", inference_id))
+    tags = tags if tags is not None else []
+    for tag in tags:
+        params.append(("tag", tag))
+    wrapped_url = wrap_url(_add_params_to_url(url=url, params=params))
+    fields = {
+        "name": f"{local_image_id}.jpg",
+        "file": ("imageToUpload", image_bytes, "image/jpeg"),
+    }
+    if metadata is not None:
+        fields["metadata"] = json.dumps(metadata)
+    m = MultipartEncoder(fields=fields)
+    headers = build_roboflow_api_headers(
+        explicit_headers={"Content-Type": m.content_type},
+    )
+    response = requests.post(
+        url=wrapped_url,
+        data=m,
+        headers=headers,
+        timeout=ROBOFLOW_API_REQUEST_TIMEOUT,
+        verify=ROBOFLOW_API_VERIFY_SSL,
+    )
+    api_key_safe_raise_for_status(response=response)
+    parsed_response = response.json()
+    if not parsed_response.get("duplicate") and not parsed_response.get("success"):
+        raise RoboflowAPIImageUploadRejectionError(
+            f"Server rejected image: {parsed_response}"
+        )
+    return parsed_response
+
+
+@wrap_roboflow_api_errors(
+    http_errors_handlers={
+        409: lambda e: raise_from_lambda(
+            e,
+            RoboflowAPIIAlreadyAnnotatedError,
+            "Given datapoint already has annotation.",
+        )
+    }
+)
+def annotate_image_at_roboflow(
+    api_key: str,
+    dataset_id: DatasetID,
+    local_image_id: str,
+    roboflow_image_id: str,
+    annotation_content: str,
+    annotation_file_type: str,
+    is_prediction: bool = True,
+) -> dict:
+    url = f"{API_BASE_URL}/dataset/{dataset_id}/annotate/{roboflow_image_id}"
+    params = [
+        ("api_key", api_key),
+        ("name", f"{local_image_id}.{annotation_file_type}"),
+        ("prediction", str(is_prediction).lower()),
+    ]
+    wrapped_url = wrap_url(_add_params_to_url(url=url, params=params))
+    headers = build_roboflow_api_headers(
+        explicit_headers={"Content-Type": "text/plain"},
+    )
+    response = requests.post(
+        wrapped_url,
+        data=annotation_content,
+        headers=headers,
+        timeout=ROBOFLOW_API_REQUEST_TIMEOUT,
+        verify=ROBOFLOW_API_VERIFY_SSL,
+    )
+    api_key_safe_raise_for_status(response=response)
+    parsed_response = response.json()
+    if "error" in parsed_response or not parsed_response.get("success"):
+        raise RoboflowAPIIAnnotationRejectionError(
+            f"Failed to save annotation for {roboflow_image_id}. API response: {parsed_response}"
+        )
+    return parsed_response
+
+
+@wrap_roboflow_api_errors()
+def get_roboflow_labeling_batches(
+    api_key: str, workspace_id: WorkspaceID, dataset_id: str
+) -> dict:
+    api_url = _add_params_to_url(
+        url=f"{API_BASE_URL}/{workspace_id}/{dataset_id}/batches",
+        params=[("api_key", api_key)],
+    )
+    return _get_from_url(url=api_url)
+
+
+@wrap_roboflow_api_errors()
+def get_roboflow_labeling_jobs(
+    api_key: str, workspace_id: WorkspaceID, dataset_id: str
+) -> dict:
+    api_url = _add_params_to_url(
+        url=f"{API_BASE_URL}/{workspace_id}/{dataset_id}/jobs",
+        params=[("api_key", api_key)],
+    )
+    return _get_from_url(url=api_url)
+
+
+def get_workflow_cache_file(
+    workspace_id: WorkspaceID,
+    workflow_id: str,
+    api_key: Optional[str],
+    workflow_version_id: Optional[str] = None,
+) -> str:
+    sanitized_workspace_id = sanitize_path_segment(workspace_id)
+    sanitized_workflow_id = sanitize_path_segment(workflow_id)
+    if SINGLE_TENANT_WORKFLOW_CACHE:
+        version_suffix = (
+            f"_v{sanitize_path_segment(workflow_version_id)}"
+            if workflow_version_id
+            else ""
+        )
+        filename = f"{sanitized_workflow_id}{version_suffix}.json"
+    else:
+        cache_seed = f"{workspace_id}:{api_key or ''}"
+        cache_fingerprint = hashlib.sha256(
+            cache_seed.encode("utf-8"), usedforsecurity=False
+        ).hexdigest()
+        filename = f"{sanitized_workflow_id}_{cache_fingerprint}.json"
+    prefix = os.path.abspath(os.path.join(MODEL_CACHE_DIR, "workflow"))
+    result = os.path.abspath(
+        os.path.join(
+            prefix,
+            sanitized_workspace_id,
+            filename,
+        )
+    )
+    if not result.startswith(prefix):
+        raise ValueError(
+            "Detected attempt to save workflow definition in insecure location"
+        )
+    return result
+
+
+def cache_workflow_response(
+    workspace_id: WorkspaceID,
+    workflow_id: str,
+    api_key: Optional[str],
+    response: dict,
+    workflow_version_id: Optional[str] = None,
+):
+    workflow_cache_file = get_workflow_cache_file(
+        workspace_id=workspace_id,
+        workflow_id=workflow_id,
+        api_key=api_key,
+        workflow_version_id=workflow_version_id,
+    )
+    workflow_cache_dir = os.path.dirname(workflow_cache_file)
+    if not os.path.exists(workflow_cache_dir):
+        os.makedirs(workflow_cache_dir, exist_ok=True)
+    with open(workflow_cache_file, "w") as f:
+        json.dump(response, f)
+
+
+def delete_cached_workflow_response_if_exists(
+    workspace_id: WorkspaceID,
+    workflow_id: str,
+    api_key: Optional[str],
+    workflow_version_id: Optional[str] = None,
+) -> None:
+    workflow_cache_file = get_workflow_cache_file(
+        workspace_id=workspace_id,
+        workflow_id=workflow_id,
+        api_key=api_key,
+        workflow_version_id=workflow_version_id,
+    )
+    if os.path.exists(workflow_cache_file):
+        os.remove(workflow_cache_file)
+
+
+def load_cached_workflow_response(
+    workspace_id: WorkspaceID,
+    workflow_id: str,
+    api_key: Optional[str],
+    workflow_version_id: Optional[str] = None,
+) -> Optional[dict]:
+    workflow_cache_file = get_workflow_cache_file(
+        workspace_id=workspace_id,
+        workflow_id=workflow_id,
+        api_key=api_key,
+        workflow_version_id=workflow_version_id,
+    )
+    if not os.path.exists(workflow_cache_file):
+        return None
+    try:
+        with open(workflow_cache_file, "r") as f:
+            return json.load(f)
+    except Exception:
+        delete_cached_workflow_response_if_exists(
+            workspace_id=workspace_id,
+            workflow_id=workflow_id,
+            api_key=api_key,
+            workflow_version_id=workflow_version_id,
+        )
+
+
+@wrap_roboflow_api_errors()
+def get_workflow_specification(
+    api_key: Optional[str],
+    workspace_id: WorkspaceID,
+    workflow_id: str,
+    use_cache: bool = True,
+    ephemeral_cache: Optional[BaseCache] = None,
+    workflow_version_id: Optional[str] = None,
+) -> dict:
+    ephemeral_cache = ephemeral_cache or cache
+    if use_cache:
+        cached_entry = _retrieve_workflow_specification_from_ephemeral_cache(
+            api_key=api_key,
+            workspace_id=workspace_id,
+            workflow_id=workflow_id,
+            workflow_version_id=workflow_version_id,
+            ephemeral_cache=ephemeral_cache,
+        )
+        if cached_entry:
+            return cached_entry
+
+    if workspace_id == "local":
+        if not re.match(r"^[\w\-]+$", workflow_id):
+            raise ValueError("Invalid workflow id")
+
+        workflow_hash = sha256(workflow_id.encode()).hexdigest()
+        local_file_path = (
+            Path(MODEL_CACHE_DIR) / "workflow" / "local" / f"{workflow_hash}.json"
+        )
+        if not local_file_path.exists():
+            raise FileNotFoundError(f"Local workflow file not found: {local_file_path}")
+
+        with local_file_path.open("r", encoding="utf-8") as f:
+            local_config = json.load(f)
+
+        # Mimic the same shape as the cloud response:
+        response = {"workflow": local_config}
+    else:
+        params = []
+        if api_key is not None and api_key != LOCAL_API_KEY:
+            params.append(("api_key", api_key))
+        if workflow_version_id is not None:
+            params.append(("workflow_version", workflow_version_id))
+        api_url = _add_params_to_url(
+            url=f"{API_BASE_URL}/{workspace_id}/workflows/{workflow_id}",
+            params=params,
+        )
+        try:
+            response = _get_from_url(url=api_url)
+            if USE_FILE_CACHE_FOR_WORKFLOWS_DEFINITIONS:
+                cache_workflow_response(
+                    workspace_id=workspace_id,
+                    workflow_id=workflow_id,
+                    api_key=api_key,
+                    response=response,
+                    workflow_version_id=workflow_version_id,
+                )
+        except (
+            requests.exceptions.ConnectionError,
+            ConnectionError,
+            requests.exceptions.Timeout,
+        ) as error:
+            if not USE_FILE_CACHE_FOR_WORKFLOWS_DEFINITIONS:
+                raise error
+            response = load_cached_workflow_response(
+                workspace_id=workspace_id,
+                workflow_id=workflow_id,
+                api_key=api_key,
+                workflow_version_id=workflow_version_id,
+            )
+            if response is None:
+                raise error
+
+    if "workflow" not in response or "config" not in response["workflow"]:
+        raise MalformedWorkflowResponseError(
+            "Could not find workflow specification in API response"
+        )
+    try:
+        workflow_config = json.loads(response["workflow"]["config"])
+        specification = workflow_config["specification"]
+        if isinstance(specification, dict):
+            specification["id"] = response["workflow"].get("id")
+        if use_cache:
+            _cache_workflow_specification_in_ephemeral_cache(
+                api_key=api_key,
+                workspace_id=workspace_id,
+                workflow_id=workflow_id,
+                workflow_version_id=workflow_version_id,
+                specification=specification,
+                ephemeral_cache=ephemeral_cache,
+            )
+        return specification
+    except KeyError as error:
+        raise MalformedWorkflowResponseError(
+            "Workflow specification not found in Roboflow API response"
+        ) from error
+    except (ValueError, TypeError) as error:
+        raise MalformedWorkflowResponseError(
+            "Could not decode workflow specification in Roboflow API response"
+        ) from error
+
+
+def _retrieve_workflow_specification_from_ephemeral_cache(
+    api_key: Optional[str],
+    workspace_id: WorkspaceID,
+    workflow_id: str,
+    ephemeral_cache: BaseCache,
+    workflow_version_id: Optional[str] = None,
+) -> Optional[dict]:
+    cache_key = _prepare_workflow_response_cache_key(
+        api_key=api_key,
+        workspace_id=workspace_id,
+        workflow_id=workflow_id,
+        workflow_version_id=workflow_version_id,
+    )
+    return ephemeral_cache.get(key=cache_key)
+
+
+def _cache_workflow_specification_in_ephemeral_cache(
+    api_key: Optional[str],
+    workspace_id: WorkspaceID,
+    workflow_id: str,
+    specification: dict,
+    ephemeral_cache: BaseCache,
+    workflow_version_id: Optional[str] = None,
+) -> None:
+    cache_key = _prepare_workflow_response_cache_key(
+        api_key=api_key,
+        workspace_id=workspace_id,
+        workflow_id=workflow_id,
+        workflow_version_id=workflow_version_id,
+    )
+    ephemeral_cache.set(
+        key=cache_key,
+        value=specification,
+        expire=WORKFLOWS_DEFINITION_CACHE_EXPIRY,
+    )
+
+
+def _prepare_workflow_response_cache_key(
+    api_key: Optional[str],
+    workspace_id: WorkspaceID,
+    workflow_id: str,
+    workflow_version_id: Optional[str] = None,
+) -> str:
+    workflow_version_suffix = (
+        f":workflow_version={workflow_version_id}" if workflow_version_id else ""
+    )
+    if SINGLE_TENANT_WORKFLOW_CACHE:
+        return (
+            f"workflow_definition:{workspace_id}:{workflow_id}{workflow_version_suffix}"
+        )
+    cache_seed = f"{workspace_id}:{api_key or ''}"
+    cache_fingerprint = hashlib.sha256(
+        cache_seed.encode("utf-8"), usedforsecurity=False
+    ).hexdigest()
+    return f"workflow_definition:{workspace_id}:{workflow_id}{workflow_version_suffix}:{cache_fingerprint}"
+
+
+@wrap_roboflow_api_errors()
+def get_from_url(
+    url: str,
+    json_response: bool = True,
+) -> Union[Response, dict]:
+    return _get_from_url(
+        url=url,
+        json_response=json_response,
+    )
+
+
+@backoff.on_exception(
+    backoff.constant,
+    exception=RetryRequestError,
+    max_tries=TRANSIENT_ROBOFLOW_API_ERRORS_RETRIES,
+    interval=TRANSIENT_ROBOFLOW_API_ERRORS_RETRY_INTERVAL,
+)
+def _get_from_url(
+    url: str,
+    json_response: bool = True,
+    headers: Optional[dict] = None,
+) -> Union[Response, dict]:
+    full_url = wrap_url(url)
+    try:
+        response = requests.get(
+            full_url,
+            headers=build_roboflow_api_headers(explicit_headers=headers),
+            timeout=ROBOFLOW_API_REQUEST_TIMEOUT,
+            verify=ROBOFLOW_API_VERIFY_SSL,
+        )
+
+    except (ConnectionError, Timeout, requests.exceptions.ConnectionError) as error:
+        if RETRY_CONNECTION_ERRORS_TO_ROBOFLOW_API:
+            raise RetryRequestError(
+                message="Connectivity error", inner_error=error
+            ) from error
+        raise error
+    try:
+        api_key_safe_raise_for_status(response=response)
+    except Exception as error:
+        if response.status_code in TRANSIENT_ROBOFLOW_API_ERRORS:
+            raise RetryRequestError(message=str(error), inner_error=error) from error
+        raise error
+
+    if MD5_VERIFICATION_ENABLED:
+        x_goog_hash = response.headers.get("x-goog-hash")
+        if x_goog_hash is None:
+            logger.warning(
+                f"MD5 verification enabled but response missing x-goog-hash header. "
+                f"Request url: {_url_for_safe_logging(full_url)}"
+            )
+        else:
+            md5_part = None
+            for part in x_goog_hash.split(","):
+                if part.strip().startswith("md5="):
+                    md5_part = part.strip()[4:]
+                    break
+            if md5_part is not None:
+                try:
+                    md5_from_header = base64.b64decode(md5_part)
+                except binascii.Error as decode_error:
+                    raise RoboflowAPIUnsuccessfulRequestError(
+                        "Invalid MD5 value in x-goog-hash header: not valid base64"
+                    ) from decode_error
+                if md5_from_header != hashlib.md5(response.content).digest():
+                    raise RoboflowAPIUnsuccessfulRequestError(
+                        "MD5 hash does not match MD5 received from x-goog-hash header"
+                    )
+            else:
+                logger.warning(
+                    f"MD5 verification enabled but x-goog-hash header has no md5= part. "
+                    f"Request url: {_url_for_safe_logging(full_url)}"
+                )
+
+    if json_response:
+        return response.json()
+    return response
+
+
+def _test_range_request(url: str, timeout: int = 10) -> bool:
+    """Test if server actually honors range requests by making a real range GET request.
+
+    Note: We can't rely on Accept-Ranges header alone because some servers/CDNs
+    advertise range support but return 200 (full file) instead of 206 (partial).
+    """
+    try:
+        headers = {"Range": "bytes=0-0"}
+        response = requests.get(
+            wrap_url(url), headers=headers, stream=True, timeout=timeout
+        )
+        response.close()
+        if response.status_code == 206:
+            return True
+
+        return False
+    except Exception as e:
+        logger.warning(
+            f"Failed to test range request support: {e}. Falling back to single-threaded download."
+        )
+        return False
+
+
+def stream_url_to_cache(
+    url: str,
+    filename: str,
+    model_id: str,
+) -> None:
+    from inference_models.utils.download import download_files_to_directory
+
+    with start_span(
+        "roboflow_api.download_artifact",
+        {"http.url": _url_for_safe_logging(url), "model.id": model_id},
+    ):
+        initialise_cache(model_id=model_id)
+        cache_dir = get_cache_dir(model_id=model_id)
+        md5_hash = None
+
+        max_threads = 8 if _test_range_request(url) else 1
+
+        try:
+            download_files_to_directory(
+                target_dir=cache_dir,
+                files_specs=[(filename, wrap_url(url), md5_hash)],
+                verbose=True,
+                download_files_without_hash=True,
+                verify_hash_while_download=False,
+                max_threads_per_download=max_threads,
+            )
+        except Exception as e:
+            raise RoboflowAPIUnsuccessfulRequestError(
+                f"Failed to download {filename}: {str(e)}"
+            ) from e
+
+
+def _url_for_safe_logging(url: str) -> str:
+    """Return a URL safe to log by stripping the query string (and params/fragment).
+
+    Expects the full URL as used for the request (e.g. already wrapped).
+    Use this when logging request URLs so that sensitive query parameters
+    (e.g. api_key, tokens) are never written to logs.
+    """
+    parsed = urllib.parse.urlparse(url)
+    return urllib.parse.urlunparse(
+        (parsed.scheme, parsed.netloc, parsed.path, "", "", "")
+    )
+
+
+def _add_params_to_url(url: str, params: List[Tuple[str, str]]) -> str:
+    if len(params) == 0:
+        return url
+    params_chunks = [
+        f"{name}={urllib.parse.quote_plus(value)}" for name, value in params
+    ]
+    parameters_string = "&".join(params_chunks)
+    return f"{url}?{parameters_string}"
+
+
+@wrap_roboflow_api_errors()
+def send_inference_results_to_model_monitoring(
+    api_key: str,
+    workspace_id: WorkspaceID,
+    inference_data: dict,
+):
+    api_url = wrap_url(
+        _add_params_to_url(
+            url=f"{API_BASE_URL}/{workspace_id}/inference-stats",
+            params=[("api_key", api_key)],
+        )
+    )
+    response = requests.post(
+        url=api_url,
+        json=inference_data,
+        headers=build_roboflow_api_headers(),
+        timeout=ROBOFLOW_API_REQUEST_TIMEOUT,
+        verify=ROBOFLOW_API_VERIFY_SSL,
+    )
+    api_key_safe_raise_for_status(response=response)
+
+
+def get_extra_weights_provider_headers(
+    countinference: Optional[bool] = None,
+    service_secret: Optional[str] = None,
+) -> Optional[Dict[str, str]]:
+    headers = {}
+    if GCP_SERVERLESS:
+        headers[ENFORCE_INTERNAL_ARTIFACTS_URLS_HEADER] = "true"
+    if ENFORCE_CREDITS_VERIFICATION:
+        skip = (
+            countinference is False
+            and service_secret is not None
+            and service_secret == ROBOFLOW_SERVICE_SECRET
+        )
+        if not skip:
+            headers[ENFORCE_CREDITS_VERIFICATION_HEADER] = "true"
+    if ROBOFLOW_INTERNAL_SERVICE_SECRET:
+        headers["X-Roboflow-Internal-Service-Secret"] = ROBOFLOW_INTERNAL_SERVICE_SECRET
+    return build_roboflow_api_headers(explicit_headers=headers)
+
+
+def build_roboflow_api_headers(
+    explicit_headers: Optional[Dict[str, Union[str, List[str]]]] = None,
+) -> Dict[str, Union[str, List[str]]]:
+    if explicit_headers is None:
+        explicit_headers = {}
+    explicit_headers = {
+        **explicit_headers,
+        ROBOFLOW_INFERENCE_VERSION_HEADER: __version__,
+        ALLOW_CHUNKED_RESPONSE_HEADER: "true",
+    }
+    if not ROBOFLOW_API_EXTRA_HEADERS:
+        return explicit_headers
+    try:
+        extra_headers: dict = json.loads(ROBOFLOW_API_EXTRA_HEADERS)
+        if explicit_headers:
+            extra_headers.update(explicit_headers)
+        return extra_headers
+    except ValueError:
+        logger.warning("Could not decode ROBOFLOW_API_EXTRA_HEADERS")
+        return explicit_headers
+
+
+def post_to_roboflow_api(
+    endpoint: str,
+    api_key: Optional[str],
+    payload: Optional[dict] = None,
+    params: Optional[List[Tuple[str, str]]] = None,
+    http_errors_handlers: Optional[
+        Dict[int, Callable[[Union[requests.exceptions.HTTPError]], None]]
+    ] = None,
+) -> dict:
+    """Generic function to make a POST request to the Roboflow API.
+
+    Args:
+        endpoint: API endpoint path
+        api_key: Roboflow API key
+        payload: JSON payload
+        params: Additional URL parameters
+        http_errors_handlers: Optional custom HTTP error handlers by status code
+    """
+
+    @wrap_roboflow_api_errors(http_errors_handlers=http_errors_handlers)
+    def _make_request():
+        url_params = []
+        if api_key and api_key != LOCAL_API_KEY:
+            url_params.append(("api_key", api_key))
+        if params:
+            url_params.extend(params)
+
+        full_url = _add_params_to_url(
+            url=f"{API_BASE_URL}/{endpoint.strip('/')}", params=url_params
+        )
+        wrapped_url = wrap_url(full_url)
+
+        headers = build_roboflow_api_headers()
+
+        response = requests.post(
+            url=wrapped_url,
+            json=payload,
+            headers=headers,
+            timeout=ROBOFLOW_API_REQUEST_TIMEOUT,
+            verify=ROBOFLOW_API_VERIFY_SSL,
+        )
+        api_key_safe_raise_for_status(response=response)
+        return response.json()
+
+    return _make_request()

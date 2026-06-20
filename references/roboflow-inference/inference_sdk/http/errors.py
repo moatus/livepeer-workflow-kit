@@ -1,0 +1,170 @@
+from typing import Optional
+
+
+class HTTPClientError(Exception):
+    """Base class for HTTP client errors."""
+
+    pass
+
+
+class HTTPCallErrorError(HTTPClientError):
+    """Error for HTTP call errors.
+
+    Attributes:
+        description: The description of the error.
+        status_code: The status code of the error.
+        api_message: The API message of the error.
+    """
+
+    def __init__(
+        self,
+        description: str,
+        status_code: int,
+        api_message: Optional[str],
+    ):
+        super().__init__(description)
+        self.__description = description
+        self.__api_message = api_message
+        self.__status_code = status_code
+
+    @property
+    def description(self) -> str:
+        """The description of the error."""
+        return self.__description
+
+    @property
+    def api_message(self) -> str:
+        """The API message of the error."""
+        return self.__api_message
+
+    @property
+    def status_code(self) -> int:
+        """The status code of the error."""
+        return self.__status_code
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"description='{self.description}', "
+            f"api_message='{self.api_message}',"
+            f"status_code={self.__status_code})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()
+
+
+class InvalidInputFormatError(HTTPClientError):
+    """Error for invalid input format."""
+
+    pass
+
+
+class InvalidModelIdentifier(HTTPClientError):
+    """Error for invalid model identifier."""
+
+    pass
+
+
+class ModelNotInitializedError(HTTPClientError):
+    """Error for model not initialized."""
+
+    pass
+
+
+class ModelTaskTypeNotSupportedError(HTTPClientError):
+    """Error for model task type not supported."""
+
+    pass
+
+
+class ModelNotSelectedError(HTTPClientError):
+    """Error for model not selected."""
+
+    pass
+
+
+class APIKeyNotProvided(HTTPClientError):
+    """Error for API key not provided."""
+
+    pass
+
+
+class EncodingError(HTTPClientError):
+    """Error for encoding errors."""
+
+    pass
+
+
+class WrongClientModeError(HTTPClientError):
+    """Error for wrong client mode."""
+
+    pass
+
+
+class InvalidParameterError(HTTPClientError):
+    """Error for invalid parameter."""
+
+    pass
+
+
+class FeatureDeprecatedError(HTTPClientError):
+    """Raised when a deprecated SDK helper is invoked."""
+
+    def __init__(
+        self,
+        feature: str,
+        *,
+        reason: Optional[str] = None,
+        removal_release: Optional[str] = None,
+        replacement: Optional[str] = None,
+    ):
+        self.feature = feature
+        self.reason = reason
+        self.removal_release = removal_release
+        self.replacement = replacement
+        public = f"SDK helper '{feature}' has been removed."
+        if reason:
+            public += f" {reason}"
+        if removal_release:
+            public += f" Removed in {removal_release}."
+        if replacement:
+            public += f" Closest replacement: {replacement}."
+        super().__init__(public)
+
+
+class RetryError(Exception):
+
+    def __init__(
+        self,
+        description: str,
+        status_code: Optional[int] = None,
+        inner_error: Optional[Exception] = None,
+    ):
+        super().__init__(description)
+        self._description = description
+        self._status_code = status_code
+        self._inner_error = inner_error
+
+    @property
+    def description(self) -> str:
+        return self._description
+
+    @property
+    def status_code(self) -> Optional[int]:
+        return self._status_code
+
+    @property
+    def inner_error(self) -> Optional[Exception]:
+        return self._inner_error
+
+    def __repr__(self) -> str:
+        return (
+            f"{self.__class__.__name__}("
+            f"description='{self.description}', "
+            f"status_code='{self._status_code}',"
+            f"inner_error={self._inner_error})"
+        )
+
+    def __str__(self) -> str:
+        return self.__repr__()

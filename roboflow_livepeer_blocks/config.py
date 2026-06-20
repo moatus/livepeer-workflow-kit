@@ -1,0 +1,98 @@
+"""Environment-backed configuration for Livepeer Roboflow blocks."""
+
+from __future__ import annotations
+
+import os
+from typing import Optional
+
+DEFAULT_OPEN_CLEARINGHOUSE_URL = "https://loc.cloudspe.com"
+DEFAULT_AUDIO_DIARIZED_TRANSCRIPTION_RUNNER_URL = "http://audio-diarized-transcription-runner:8080"
+DEFAULT_NEMO_DIARIZED_RUNNER_URL = DEFAULT_AUDIO_DIARIZED_TRANSCRIPTION_RUNNER_URL
+DEFAULT_LOCAL_AUDIO_INGEST_URL = "http://local-audio-ingest:8876"
+DEFAULT_VDO_SIGNALING_SERVER_URL = ""
+DEFAULT_ROBOFLOW_INFERENCE_URL = ""
+DEFAULT_VISION_BACKEND = "livepeer_remote"
+DEFAULT_FLORENCE2_RUNNER_URL = "http://florence2-runner:8080"
+DEFAULT_VISION_CAPABILITY = "openai:vision"
+DEFAULT_VISION_OFFERING = "florence-2-large"
+DEFAULT_TRUE_STREAMING_TRANSCRIPTION_BACKEND = "livepeer_remote_http"
+DEFAULT_TRUE_STREAMING_CAPABILITY = "openai:audio-transcriptions"
+DEFAULT_TRUE_STREAMING_OFFERING = "nemo-meeting"
+OPEN_CLEARINGHOUSE_URL_ENV = "LIVEPEER_OPEN_CLEARINGHOUSE_URL"
+OPEN_CLEARINGHOUSE_API_KEY_ENV = "LIVEPEER_OPEN_CLEARINGHOUSE_API_KEY"
+AUDIO_DIARIZED_TRANSCRIPTION_RUNNER_URL_ENV = "AUDIO_DIARIZED_TRANSCRIPTION_RUNNER_URL"
+NEMO_DIARIZED_RUNNER_URL_ENV = "NEMO_DIARIZED_RUNNER_URL"
+LOCAL_AUDIO_INGEST_URL_ENV = "LOCAL_AUDIO_INGEST_URL"
+VDO_SIGNALING_SERVER_URL_ENV = "VDO_SIGNALING_SERVER_URL"
+ROBOFLOW_API_KEY_ENV = "ROBOFLOW_API_KEY"
+ROBOFLOW_INFERENCE_URL_ENV = "ROBOFLOW_INFERENCE_URL"
+VISION_BACKEND_ENV = "LIVEPEER_VISION_BACKEND"
+FLORENCE2_RUNNER_URL_ENV = "FLORENCE2_RUNNER_URL"
+VISION_CAPABILITY_ENV = "LIVEPEER_VISION_CAPABILITY"
+VISION_OFFERING_ENV = "LIVEPEER_VISION_OFFERING"
+TRUE_STREAMING_TRANSCRIPTION_BACKEND_ENV = "LIVEPEER_TRUE_STREAMING_TRANSCRIPTION_BACKEND"
+TRUE_STREAMING_CAPABILITY_ENV = "LIVEPEER_TRUE_STREAMING_CAPABILITY"
+TRUE_STREAMING_OFFERING_ENV = "LIVEPEER_TRUE_STREAMING_OFFERING"
+
+
+def init_open_clearinghouse_url() -> str:
+    return os.getenv(OPEN_CLEARINGHOUSE_URL_ENV, DEFAULT_OPEN_CLEARINGHOUSE_URL)
+
+
+def init_open_clearinghouse_api_key() -> Optional[str]:
+    return os.getenv(OPEN_CLEARINGHOUSE_API_KEY_ENV)
+
+
+def init_true_streaming_transcription_backend() -> str:
+    return os.getenv(
+        TRUE_STREAMING_TRANSCRIPTION_BACKEND_ENV,
+        DEFAULT_TRUE_STREAMING_TRANSCRIPTION_BACKEND,
+    )
+
+
+def init_true_streaming_capability() -> str:
+    return os.getenv(TRUE_STREAMING_CAPABILITY_ENV, DEFAULT_TRUE_STREAMING_CAPABILITY)
+
+
+def init_true_streaming_offering() -> str:
+    return os.getenv(TRUE_STREAMING_OFFERING_ENV, DEFAULT_TRUE_STREAMING_OFFERING)
+
+
+def init_nemo_diarized_runner_url() -> str:
+    return (
+        os.getenv(AUDIO_DIARIZED_TRANSCRIPTION_RUNNER_URL_ENV)
+        or os.getenv(NEMO_DIARIZED_RUNNER_URL_ENV)
+        or DEFAULT_AUDIO_DIARIZED_TRANSCRIPTION_RUNNER_URL
+    )
+
+
+def init_local_audio_ingest_url() -> str:
+    return os.getenv(LOCAL_AUDIO_INGEST_URL_ENV, DEFAULT_LOCAL_AUDIO_INGEST_URL)
+
+
+def init_vdo_signaling_server_url() -> str:
+    return os.getenv(VDO_SIGNALING_SERVER_URL_ENV, DEFAULT_VDO_SIGNALING_SERVER_URL)
+
+
+def init_roboflow_api_key() -> Optional[str]:
+    return os.getenv(ROBOFLOW_API_KEY_ENV)
+
+
+def init_roboflow_inference_url() -> str:
+    return os.getenv(ROBOFLOW_INFERENCE_URL_ENV, DEFAULT_ROBOFLOW_INFERENCE_URL)
+
+
+def init_vision_backend() -> str:
+    return os.getenv(VISION_BACKEND_ENV, DEFAULT_VISION_BACKEND)
+
+
+def init_florence2_runner_url() -> str:
+    return os.getenv(FLORENCE2_RUNNER_URL_ENV, DEFAULT_FLORENCE2_RUNNER_URL)
+
+
+def init_vision_capability() -> str:
+    return os.getenv(VISION_CAPABILITY_ENV, DEFAULT_VISION_CAPABILITY)
+
+
+def init_vision_offering() -> str:
+    return os.getenv(VISION_OFFERING_ENV, DEFAULT_VISION_OFFERING)

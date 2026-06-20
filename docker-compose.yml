@@ -1,0 +1,176 @@
+services:
+  livepeer-poc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: livepeer-roboflow-transcription-poc:local
+    runtime: nvidia
+    ipc: host
+    environment:
+      LIVEPEER_OPEN_CLEARINGHOUSE_API_KEY: ${LIVEPEER_OPEN_CLEARINGHOUSE_API_KEY:-}
+      LIVEPEER_OPEN_CLEARINGHOUSE_URL: ${LIVEPEER_OPEN_CLEARINGHOUSE_URL:-https://loc.cloudspe.com}
+      AUDIO_DIARIZED_TRANSCRIPTION_RUNNER_URL: ${AUDIO_DIARIZED_TRANSCRIPTION_RUNNER_URL:-http://audio-diarized-transcription-runner:8080}
+      NEMO_DIARIZED_RUNNER_URL: ${NEMO_DIARIZED_RUNNER_URL:-http://audio-diarized-transcription-runner:8080}
+      FLORENCE2_RUNNER_URL: ${FLORENCE2_RUNNER_URL:-}
+      LIVEPEER_VISION_BACKEND: ${LIVEPEER_VISION_BACKEND:-livepeer_remote}
+      LIVEPEER_VISION_CAPABILITY: ${LIVEPEER_VISION_CAPABILITY:-openai:vision}
+      LIVEPEER_VISION_OFFERING: ${LIVEPEER_VISION_OFFERING:-florence-2-large}
+      LOCAL_AUDIO_INGEST_URL: ${LOCAL_AUDIO_INGEST_URL:-http://local-audio-ingest:8876}
+      VDO_SIGNALING_SERVER_URL: ${VDO_SIGNALING_SERVER_URL:-wss://vdo-signaling-bridge:9443}
+      DISABLE_VERSION_CHECK: "true"
+      METRICS_ENABLED: "false"
+      CORE_MODEL_GAZE_ENABLED: "false"
+      PYTHONPATH: /workspace/livepeer:/workspace/livepeer/references/roboflow-inference
+      WORKFLOWS_PLUGIN_ONLY_CORE: "true"
+      WORKFLOWS_PLUGINS: roboflow_livepeer_blocks
+      GI_TYPELIB_PATH: /usr/lib/x86_64-linux-gnu/girepository-1.0
+      RN_FORCE_SINK: fakesink sync=true async=false
+      RN_FORCE_AUDIO_SINK: fakesink sync=true async=false
+      XDG_RUNTIME_DIR: /tmp/xdg-runtime
+      HF_HOME: /root/.cache/huggingface
+      TRANSFORMERS_CACHE: /root/.cache/huggingface/hub
+      TORCH_HOME: /root/.cache/torch
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    volumes:
+      - ./:/workspace/livepeer
+      - ./artifacts:/workspace/livepeer/artifacts
+      - livepeer-poc-hf-cache:/root/.cache/huggingface
+      - livepeer-poc-torch-cache:/root/.cache/torch
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  local-audio-ingest:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: livepeer-roboflow-transcription-poc:local
+    command: ["local-ingest", "--host", "0.0.0.0", "--port", "8876"]
+    environment:
+      PYTHONPATH: /workspace/livepeer:/workspace/livepeer/references/roboflow-inference
+      WORKFLOWS_PLUGIN_ONLY_CORE: "true"
+      WORKFLOWS_PLUGINS: roboflow_livepeer_blocks
+      LOCAL_AUDIO_INGEST_URL: http://local-audio-ingest:8876
+    ports:
+      - "8876:8876"
+    volumes:
+      - ./:/workspace/livepeer
+      - ./artifacts:/workspace/livepeer/artifacts
+
+  vdo-signaling-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: livepeer-roboflow-transcription-poc:local
+    command: ["vdo-bridge", "--host", "0.0.0.0", "--port", "9443"]
+    environment:
+      PYTHONPATH: /workspace/livepeer:/workspace/livepeer/references/roboflow-inference
+      WORKFLOWS_PLUGIN_ONLY_CORE: "true"
+      WORKFLOWS_PLUGINS: roboflow_livepeer_blocks
+      VDO_SIGNALING_SERVER_URL: wss://vdo-signaling-bridge:9443
+    ports:
+      - "9443:9443"
+    volumes:
+      - ./:/workspace/livepeer
+      - ./artifacts:/workspace/livepeer/artifacts
+
+  audio-diarized-transcription-runner:
+    profiles:
+      - diarized
+      - nemo
+    build:
+      context: ../audio-diarized-transcription-runner
+      dockerfile: infra/dockerfiles/audio-diarized-transcription-runner.Dockerfile
+    image: audio-diarized-transcription-runner:local
+    runtime: nvidia
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      RUNNER_PORT: "8080"
+      DEVICE: ${NEMO_DEVICE:-cuda}
+      CAPABILITY_NAME: openai:audio-transcriptions
+      METRICS_ENABLED: ${NEMO_METRICS_ENABLED:-false}
+      MAX_QUEUE_SIZE: ${NEMO_MAX_QUEUE_SIZE:-1}
+      MAX_AUDIO_MB: ${NEMO_MAX_AUDIO_MB:-100}
+      MODEL_CACHE_DIR: /models
+      WORK_DIR: /tmp/audio-diarized-transcription-runner
+      DEFAULT_VAD_MODEL: vad_multilingual_marblenet
+      DEFAULT_SPEAKER_MODEL: titanet_large
+      DEFAULT_ASR_MODEL: stt_en_conformer_ctc_large
+      LIVE_FINAL_ASR_MODEL: nvidia/parakeet-tdt-0.6b-v3
+      DEFAULT_MAX_SPEAKERS: "8"
+      DEFAULT_PRESET: meeting
+      LIVE_HISTORY_BUFFER_SIZE: ${LIVE_HISTORY_BUFFER_SIZE:-256}
+      LIVE_CURRENT_BUFFER_SIZE: ${LIVE_CURRENT_BUFFER_SIZE:-256}
+      LIVE_SESSION_TTL_SECONDS: ${LIVE_SESSION_TTL_SECONDS:-3600}
+      LIVE_CLOSED_SESSION_TTL_SECONDS: ${LIVE_CLOSED_SESSION_TTL_SECONDS:-300}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    ports:
+      - "${AUDIO_DIARIZED_TRANSCRIPTION_RUNNER_PORT:-8080}:8080"
+    volumes:
+      - audio-diarized-transcription-model-cache:/models
+      - audio-diarized-transcription-nemo-cache:/root/.cache/torch/NeMo
+      - audio-diarized-transcription-runner-work:/tmp/audio-diarized-transcription-runner
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  florence2-runner:
+    profiles:
+      - florence
+      - vision
+    build:
+      context: ../florence-2-runner
+      dockerfile: infra/dockerfiles/florence-2-runner.Dockerfile
+    image: florence-2-runner:local
+    runtime: nvidia
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    environment:
+      RUNNER_PORT: "8080"
+      DEVICE: ${FLORENCE2_DEVICE:-cuda}
+      CAPABILITY_NAME: ${LIVEPEER_VISION_CAPABILITY:-openai:vision}
+      METRICS_ENABLED: ${FLORENCE2_METRICS_ENABLED:-false}
+      MAX_QUEUE_SIZE: ${FLORENCE2_MAX_QUEUE_SIZE:-1}
+      MAX_IMAGE_MB: ${FLORENCE2_MAX_IMAGE_MB:-20}
+      MODEL_CACHE_DIR: /models
+      WORK_DIR: /tmp/florence-2-runner
+      DEFAULT_MODEL: ${LIVEPEER_VISION_OFFERING:-florence-2-large}
+      DEFAULT_HF_MODEL: ${FLORENCE2_DEFAULT_HF_MODEL:-microsoft/Florence-2-large}
+      NVIDIA_VISIBLE_DEVICES: all
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    ports:
+      - "${FLORENCE2_RUNNER_PORT:-8081}:8080"
+    volumes:
+      - florence2-model-cache:/models
+      - florence2-runner-work:/tmp/florence-2-runner
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  audio-diarized-transcription-model-cache:
+  audio-diarized-transcription-nemo-cache:
+  audio-diarized-transcription-runner-work:
+  florence2-model-cache:
+  florence2-runner-work:
+  livepeer-poc-hf-cache:
+  livepeer-poc-torch-cache:

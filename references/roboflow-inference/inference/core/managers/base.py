@@ -1,0 +1,705 @@
+import time
+from contextlib import contextmanager
+from threading import Lock
+from typing import Dict, Generator, List, Optional, Tuple, Union
+
+import numpy as np
+from fastapi.encoders import jsonable_encoder
+
+from inference.core.cache import model_monitoring as model_monitoring_cache_module
+from inference.core.cache.serializers import to_cachable_inference_item
+from inference.core.devices.utils import GLOBAL_INFERENCE_SERVER_ID
+from inference.core.entities.requests.inference import InferenceRequest
+from inference.core.entities.responses.inference import InferenceResponse
+from inference.core.env import (
+    DISABLE_INFERENCE_CACHE,
+    INTERNAL_WEIGHTS_URL_SUFFIX,
+    METRICS_ENABLED,
+    METRICS_INTERVAL,
+    MODEL_LOCK_ACQUIRE_TIMEOUT,
+    MODELS_CACHE_AUTH_ENABLED,
+    ROBOFLOW_SERVER_UUID,
+    USE_INFERENCE_MODELS,
+)
+from inference.core.exceptions import (
+    InferenceModelNotFound,
+    ModelManagerLockAcquisitionError,
+    RoboflowAPINotAuthorizedError,
+)
+from inference.core.logger import logger
+from inference.core.managers.entities import ModelDescription
+from inference.core.managers.model_load_collector import (
+    current_request_path,
+    model_load_info,
+    request_model_ids,
+)
+from inference.core.managers.pingback import PingbackInfo
+from inference.core.models.base import Model, PreprocessReturnMetadata
+from inference.core.registries.base import ModelRegistry
+from inference.core.registries.roboflow import (
+    ModelEndpointType,
+    _check_if_api_key_has_access_to_model,
+)
+from inference.core.telemetry import (
+    record_error,
+    record_inference,
+    record_model_loaded,
+    record_model_unloaded,
+    set_span_attribute,
+    start_span,
+)
+
+
+class ModelManager:
+    """Model managers keep track of a dictionary of Model objects and is responsible for passing requests to the right model using the infer method."""
+
+    def __init__(self, model_registry: ModelRegistry, models: Optional[dict] = None):
+        self.model_registry = model_registry
+        self._models: Dict[str, Model] = models if models is not None else {}
+        self._model_request_aliases: Dict[str, set] = {}
+        self._model_request_paths: Dict[str, set] = {}
+        self.pingback = None
+        self._state_lock = Lock()
+        self._models_state_locks: Dict[str, Lock] = {}
+
+    def init_pingback(self):
+        """Initializes pingback mechanism."""
+        self.num_errors = 0  # in the device
+        self.uuid = ROBOFLOW_SERVER_UUID
+        if METRICS_ENABLED:
+            self.pingback = PingbackInfo(self)
+            self.pingback.start()
+
+    def add_model(
+        self,
+        model_id: str,
+        api_key: str,
+        model_id_alias: Optional[str] = None,
+        endpoint_type: ModelEndpointType = ModelEndpointType.ORT,
+        countinference: Optional[bool] = None,
+        service_secret: Optional[str] = None,
+    ) -> None:
+        """Adds a new model to the manager.
+
+        Args:
+            model_id (str): The identifier of the model.
+            model (Model): The model instance.
+            endpoint_type (ModelEndpointType, optional): The endpoint type to use for the model.
+        """
+        if MODELS_CACHE_AUTH_ENABLED:
+            if not _check_if_api_key_has_access_to_model(
+                api_key=api_key,
+                model_id=model_id,
+                endpoint_type=endpoint_type,
+                countinference=countinference,
+                service_secret=service_secret,
+            ):
+                raise RoboflowAPINotAuthorizedError(
+                    f"API key {api_key} does not have access to model {model_id}"
+                )
+
+        logger.debug(
+            f"ModelManager - Adding model with model_id={model_id}, model_id_alias={model_id_alias}"
+        )
+        resolved_identifier = model_id if model_id_alias is None else model_id_alias
+        self.record_request_metadata(
+            model_id=resolved_identifier,
+            original_model_id=model_id,
+            model_id_alias=model_id_alias,
+        )
+        ids_collector = request_model_ids.get(None)
+        if ids_collector is not None:
+            ids_collector.add(resolved_identifier)
+        model_lock = self._get_lock_for_a_model(model_id=resolved_identifier)
+        with acquire_with_timeout(lock=model_lock) as acquired:
+            if not acquired:
+                # if failed to acquire - then in use, no need to purge lock
+                raise ModelManagerLockAcquisitionError(
+                    f"Could not acquire lock for model with id={resolved_identifier}."
+                )
+            if resolved_identifier in self._models:
+                logger.debug(
+                    f"ModelManager - model with model_id={resolved_identifier} is already loaded."
+                )
+                return
+            try:
+                with start_span("model.load", {"model.id": resolved_identifier}):
+                    logger.debug("ModelManager - model initialisation...")
+                    t_load_start = time.perf_counter()
+                    vram_before = _get_cuda_memory_allocated()
+                    model_class = self.model_registry.get_model(
+                        resolved_identifier,
+                        api_key,
+                        countinference=countinference,
+                        service_secret=service_secret,
+                    )
+
+                    model = model_class(
+                        model_id=model_id,
+                        api_key=api_key,
+                        countinference=countinference,
+                        service_secret=service_secret,
+                    )
+                    vram_after = _get_cuda_memory_allocated()
+                    if vram_before is not None and vram_after is not None:
+                        model._vram_bytes = vram_after - vram_before
+
+                    # Pass countinference and service_secret to download_model_artifacts_from_roboflow_api if available
+                    if (
+                        hasattr(model, "download_model_artifacts_from_roboflow_api")
+                        and INTERNAL_WEIGHTS_URL_SUFFIX == "serverless"
+                    ):
+                        # Only pass these parameters if INTERNAL_WEIGHTS_URL_SUFFIX is "serverless"
+                        if (
+                            hasattr(model, "cache_model_artefacts")
+                            and not model.has_model_metadata
+                        ):
+                            # Override the download_model_artifacts_from_roboflow_api method with parameters
+                            original_method = (
+                                model.download_model_artifacts_from_roboflow_api
+                            )
+                            model.download_model_artifacts_from_roboflow_api = (
+                                lambda: original_method(
+                                    countinference=countinference,
+                                    service_secret=service_secret,
+                                )
+                            )
+
+                    load_time = time.perf_counter() - t_load_start
+                    vram_delta = getattr(model, "_vram_bytes", None)
+                    set_span_attribute("model.load_time_seconds", load_time)
+                    record_model_loaded(resolved_identifier, load_time)
+                    logger.info(
+                        "Model loaded: model_id=%s, load_time=%.2fs, task_type=%s, vram_bytes=%s",
+                        resolved_identifier,
+                        load_time,
+                        getattr(model, "task_type", "unknown"),
+                        vram_delta,
+                    )
+                    self._models[resolved_identifier] = model
+                    collector = model_load_info.get(None)
+                    if collector is not None:
+                        collector.record(
+                            model_id=resolved_identifier, load_time=load_time
+                        )
+            except Exception as error:
+                record_error(error)
+                self._dispose_model_lock(model_id=resolved_identifier)
+                raise error
+
+    def record_request_metadata(
+        self,
+        model_id: str,
+        original_model_id: Optional[str] = None,
+        model_id_alias: Optional[str] = None,
+    ) -> None:
+        """Record request path and aliases for an already-loaded model.
+
+        Decorators call this when they short-circuit ``add_model()`` for warm
+        models so registry metadata stays in sync with the base manager path.
+        """
+        resolved_identifier = model_id
+        if resolved_identifier not in self._model_request_aliases:
+            self._model_request_aliases[resolved_identifier] = set()
+        if original_model_id is not None and original_model_id != resolved_identifier:
+            self._model_request_aliases[resolved_identifier].add(original_model_id)
+        if model_id_alias is not None and model_id_alias != resolved_identifier:
+            self._model_request_aliases[resolved_identifier].add(model_id_alias)
+        req_path = current_request_path.get(None)
+        if req_path:
+            if resolved_identifier not in self._model_request_paths:
+                self._model_request_paths[resolved_identifier] = set()
+            self._model_request_paths[resolved_identifier].add(req_path)
+
+    def check_for_model(self, model_id: str) -> None:
+        """Checks whether the model with the given ID is in the manager.
+
+        Args:
+            model_id (str): The identifier of the model.
+
+        Raises:
+            InferenceModelNotFound: If the model is not found in the manager.
+        """
+        if model_id not in self:
+            raise InferenceModelNotFound(f"Model with id {model_id} not loaded.")
+
+    async def infer_from_request(
+        self, model_id: str, request: InferenceRequest, **kwargs
+    ) -> InferenceResponse:
+        """Runs inference on the specified model with the given request.
+
+        Args:
+            model_id (str): The identifier of the model.
+            request (InferenceRequest): The request to process.
+
+        Returns:
+            InferenceResponse: The response from the inference.
+        """
+        logger.debug(
+            f"ModelManager - inference from request started for model_id={model_id}."
+        )
+        enable_model_monitoring = not getattr(
+            request, "disable_model_monitoring", False
+        )
+        if METRICS_ENABLED and self.pingback and enable_model_monitoring:
+            logger.debug("ModelManager - setting pingback fallback api key...")
+            self.pingback.fallback_api_key = request.api_key
+        with start_span(
+            "model.infer",
+            {"model.id": model_id, "model.infer.caller": "infer_from_request"},
+        ):
+            try:
+                t_infer_start = time.perf_counter()
+                rtn_val = await self.model_infer(
+                    model_id=model_id, request=request, **kwargs
+                )
+                record_inference(model_id, time.perf_counter() - t_infer_start)
+                logger.debug(
+                    f"ModelManager - inference from request finished for model_id={model_id}."
+                )
+                finish_time = time.time()
+                if not DISABLE_INFERENCE_CACHE and enable_model_monitoring:
+                    with start_span("model.infer.cache"):
+                        try:
+                            logger.debug(
+                                f"ModelManager - caching inference request started for model_id={model_id}"
+                            )
+                            model_monitoring_cache_module.model_monitoring_cache.zadd(
+                                f"models",
+                                value=f"{GLOBAL_INFERENCE_SERVER_ID}:{request.api_key}:{model_id}",
+                                score=finish_time,
+                                expire=METRICS_INTERVAL * 2,
+                            )
+                            if (
+                                hasattr(request, "image")
+                                and hasattr(request.image, "type")
+                                and request.image.type == "numpy"
+                            ):
+                                request.image.value = str(request.image.value)
+                            model_monitoring_cache_module.model_monitoring_cache.zadd(
+                                f"inference:{GLOBAL_INFERENCE_SERVER_ID}:{model_id}",
+                                value=to_cachable_inference_item(request, rtn_val),
+                                score=finish_time,
+                                expire=METRICS_INTERVAL * 2,
+                            )
+                            logger.debug(
+                                f"ModelManager - caching inference request finished for model_id={model_id}"
+                            )
+                        except Exception as cache_error:
+                            logger.warning(
+                                f"Failed to cache inference data for model {model_id}: {cache_error}"
+                            )
+                return rtn_val
+            except Exception as e:
+                record_error(e)
+                finish_time = time.time()
+                if not DISABLE_INFERENCE_CACHE and enable_model_monitoring:
+                    with start_span("model.infer.cache_error"):
+                        try:
+                            model_monitoring_cache_module.model_monitoring_cache.zadd(
+                                f"models",
+                                value=f"{GLOBAL_INFERENCE_SERVER_ID}:{request.api_key}:{model_id}",
+                                score=finish_time,
+                                expire=METRICS_INTERVAL * 2,
+                            )
+                            model_monitoring_cache_module.model_monitoring_cache.zadd(
+                                f"error:{GLOBAL_INFERENCE_SERVER_ID}:{model_id}",
+                                value={
+                                    "request": jsonable_encoder(
+                                        request.dict(
+                                            exclude={"image", "subject", "prompt"}
+                                        )
+                                    ),
+                                    "error": str(e),
+                                },
+                                score=finish_time,
+                                expire=METRICS_INTERVAL * 2,
+                            )
+                        except Exception as cache_error:
+                            logger.warning(
+                                f"Failed to cache error data for model {model_id}: {cache_error}"
+                            )
+                raise
+
+    def infer_from_request_sync(
+        self, model_id: str, request: InferenceRequest, **kwargs
+    ) -> InferenceResponse:
+        """Runs inference on the specified model with the given request.
+
+        Args:
+            model_id (str): The identifier of the model.
+            request (InferenceRequest): The request to process.
+
+        Returns:
+            InferenceResponse: The response from the inference.
+        """
+        logger.debug(
+            f"ModelManager - inference from request started for model_id={model_id}."
+        )
+        enable_model_monitoring = not getattr(
+            request, "disable_model_monitoring", False
+        )
+        if METRICS_ENABLED and self.pingback and enable_model_monitoring:
+            logger.debug("ModelManager - setting pingback fallback api key...")
+            self.pingback.fallback_api_key = request.api_key
+        with start_span(
+            "model.infer",
+            {"model.id": model_id, "model.infer.caller": "infer_from_request_sync"},
+        ):
+            try:
+                t_infer_start = time.perf_counter()
+                rtn_val = self.model_infer_sync(
+                    model_id=model_id, request=request, **kwargs
+                )
+                record_inference(model_id, time.perf_counter() - t_infer_start)
+                logger.debug(
+                    f"ModelManager - inference from request finished for model_id={model_id}."
+                )
+                finish_time = time.time()
+                if not DISABLE_INFERENCE_CACHE and enable_model_monitoring:
+                    with start_span("model.infer.cache"):
+                        try:
+                            logger.debug(
+                                f"ModelManager - caching inference request started for model_id={model_id}"
+                            )
+                            model_monitoring_cache_module.model_monitoring_cache.zadd(
+                                f"models",
+                                value=f"{GLOBAL_INFERENCE_SERVER_ID}:{request.api_key}:{model_id}",
+                                score=finish_time,
+                                expire=METRICS_INTERVAL * 2,
+                            )
+                            if (
+                                hasattr(request, "image")
+                                and hasattr(request.image, "type")
+                                and request.image.type == "numpy"
+                            ):
+                                request.image.value = str(request.image.value)
+                            model_monitoring_cache_module.model_monitoring_cache.zadd(
+                                f"inference:{GLOBAL_INFERENCE_SERVER_ID}:{model_id}",
+                                value=to_cachable_inference_item(request, rtn_val),
+                                score=finish_time,
+                                expire=METRICS_INTERVAL * 2,
+                            )
+                            logger.debug(
+                                f"ModelManager - caching inference request finished for model_id={model_id}"
+                            )
+                        except Exception as cache_error:
+                            logger.warning(
+                                f"Failed to cache inference data for model {model_id}: {cache_error}"
+                            )
+                return rtn_val
+            except Exception as e:
+                record_error(e)
+                finish_time = time.time()
+                if not DISABLE_INFERENCE_CACHE and enable_model_monitoring:
+                    with start_span("model.infer.cache_error"):
+                        try:
+                            model_monitoring_cache_module.model_monitoring_cache.zadd(
+                                f"models",
+                                value=f"{GLOBAL_INFERENCE_SERVER_ID}:{request.api_key}:{model_id}",
+                                score=finish_time,
+                                expire=METRICS_INTERVAL * 2,
+                            )
+                            model_monitoring_cache_module.model_monitoring_cache.zadd(
+                                f"error:{GLOBAL_INFERENCE_SERVER_ID}:{model_id}",
+                                value={
+                                    "request": jsonable_encoder(
+                                        request.dict(
+                                            exclude={"image", "subject", "prompt"}
+                                        )
+                                    ),
+                                    "error": str(e),
+                                },
+                                score=finish_time,
+                                expire=METRICS_INTERVAL * 2,
+                            )
+                        except Exception as cache_error:
+                            logger.warning(
+                                f"Failed to cache error data for model {model_id}: {cache_error}"
+                            )
+                raise
+
+    async def model_infer(self, model_id: str, request: InferenceRequest, **kwargs):
+        model = self._get_model_reference(model_id=model_id)
+        return model.infer_from_request(request)
+
+    def model_infer_sync(
+        self, model_id: str, request: InferenceRequest, **kwargs
+    ) -> Union[List[InferenceResponse], InferenceResponse]:
+        model = self._get_model_reference(model_id=model_id)
+        return model.infer_from_request(request)
+
+    def make_response(
+        self, model_id: str, predictions: List[List[float]], *args, **kwargs
+    ) -> InferenceResponse:
+        """Creates a response object from the model's predictions.
+
+        Args:
+            model_id (str): The identifier of the model.
+            predictions (List[List[float]]): The model's predictions.
+
+        Returns:
+            InferenceResponse: The created response object.
+        """
+        model = self._get_model_reference(model_id=model_id)
+        return model.make_response(predictions, *args, **kwargs)
+
+    def postprocess(
+        self,
+        model_id: str,
+        predictions: Tuple[np.ndarray, ...],
+        preprocess_return_metadata: PreprocessReturnMetadata,
+        *args,
+        **kwargs,
+    ) -> List[List[float]]:
+        """Processes the model's predictions after inference.
+
+        Args:
+            model_id (str): The identifier of the model.
+            predictions (np.ndarray): The model's predictions.
+
+        Returns:
+            List[List[float]]: The post-processed predictions.
+        """
+        model = self._get_model_reference(model_id=model_id)
+        return model.postprocess(
+            predictions, preprocess_return_metadata, *args, **kwargs
+        )
+
+    def predict(self, model_id: str, *args, **kwargs) -> Tuple[np.ndarray, ...]:
+        """Runs prediction on the specified model.
+
+        Args:
+            model_id (str): The identifier of the model.
+
+        Returns:
+            np.ndarray: The predictions from the model.
+        """
+        model = self._get_model_reference(model_id=model_id)
+        model.metrics["num_inferences"] += 1
+        tic = time.perf_counter()
+        res = model.predict(*args, **kwargs)
+        toc = time.perf_counter()
+        model.metrics["avg_inference_time"] += toc - tic
+        return res
+
+    def preprocess(
+        self, model_id: str, request: InferenceRequest
+    ) -> Tuple[np.ndarray, PreprocessReturnMetadata]:
+        """Preprocesses the request before inference.
+
+        Args:
+            model_id (str): The identifier of the model.
+            request (InferenceRequest): The request to preprocess.
+
+        Returns:
+            Tuple[np.ndarray, List[Tuple[int, int]]]: The preprocessed data.
+        """
+        model = self._get_model_reference(model_id=model_id)
+        return model.preprocess(**request.dict())
+
+    def get_class_names(self, model_id):
+        """Retrieves the class names for a given model.
+
+        Args:
+            model_id (str): The identifier of the model.
+
+        Returns:
+            List[str]: The class names of the model.
+        """
+        model = self._get_model_reference(model_id=model_id)
+        return model.class_names
+
+    def get_task_type(self, model_id: str, api_key: str = None) -> str:
+        """Retrieves the task type for a given model.
+
+        Args:
+            model_id (str): The identifier of the model.
+
+        Returns:
+            str: The task type of the model.
+        """
+        model = self._get_model_reference(model_id=model_id)
+        return model.task_type
+
+    def remove(self, model_id: str, delete_from_disk: bool = True) -> None:
+        """Removes a model from the manager.
+
+        Args:
+            model_id (str): The identifier of the model.
+        """
+        try:
+            logger.debug(f"Removing model {model_id} from base model manager")
+            model_lock = self._get_lock_for_a_model(model_id=model_id)
+            with acquire_with_timeout(lock=model_lock) as acquired:
+                if not acquired:
+                    raise ModelManagerLockAcquisitionError(
+                        f"Could not acquire lock for model with id={model_id}."
+                    )
+                if model_id not in self._models:
+                    return None
+                model = self._models[model_id]
+                vram_bytes = getattr(model, "_vram_bytes", None)
+                task_type = getattr(model, "task_type", "unknown")
+                model.clear_cache(delete_from_disk=delete_from_disk)
+                del self._models[model_id]
+                logger.info(
+                    "Model unloaded: model_id=%s, task_type=%s, vram_bytes=%s, remaining_models=%d",
+                    model_id,
+                    task_type,
+                    vram_bytes,
+                    len(self._models),
+                )
+                record_model_unloaded(model_id)
+                self._model_request_aliases.pop(model_id, None)
+                self._model_request_paths.pop(model_id, None)
+                self._dispose_model_lock(model_id=model_id)
+                try_releasing_cuda_memory()
+        except InferenceModelNotFound:
+            logger.warning(
+                f"Attempted to remove model with id {model_id}, but it is not loaded. Skipping..."
+            )
+
+    def clear(self) -> None:
+        """Removes all models from the manager."""
+        model_ids = list(self.keys())
+        for model_id in model_ids:
+            self.remove(model_id)
+
+    def _get_model_reference(self, model_id: str) -> Model:
+        try:
+            return self._models[model_id]
+        except KeyError as error:
+            raise InferenceModelNotFound(
+                f"Model with id {model_id} not loaded."
+            ) from error
+
+    def __contains__(self, model_id: str) -> bool:
+        """Checks if the model is contained in the manager.
+
+        Args:
+            model_id (str): The identifier of the model.
+
+        Returns:
+            bool: Whether the model is in the manager.
+        """
+        return model_id in self._models
+
+    def __getitem__(self, key: str) -> Model:
+        """Retrieve a model from the manager by key.
+
+        Args:
+            key (str): The identifier of the model.
+
+        Returns:
+            Model: The model corresponding to the key.
+        """
+        return self._get_model_reference(model_id=key)
+
+    def __len__(self) -> int:
+        """Retrieve the number of models in the manager.
+
+        Returns:
+            int: The number of models in the manager.
+        """
+        return len(self._models)
+
+    def keys(self):
+        """Retrieve the keys (model identifiers) from the manager.
+
+        Returns:
+            List[str]: The keys of the models in the manager.
+        """
+        return self._models.keys()
+
+    def models(self) -> Dict[str, Model]:
+        """Retrieve the models dictionary from the manager.
+
+        Returns:
+            Dict[str, Model]: The keys of the models in the manager.
+        """
+        return self._models
+
+    def describe_models(self) -> List[ModelDescription]:
+        return [
+            ModelDescription(
+                model_id=model_id,
+                task_type=model.task_type,
+                batch_size=getattr(model, "batch_size", None),
+                input_width=getattr(model, "img_size_w", None),
+                input_height=getattr(model, "img_size_h", None),
+                vram_bytes=getattr(model, "_vram_bytes", None),
+                request_aliases=sorted(
+                    self._model_request_aliases.get(model_id, set())
+                ),
+                request_paths=sorted(self._model_request_paths.get(model_id, set())),
+            )
+            for model_id, model in self._models.items()
+        ]
+
+    def _get_lock_for_a_model(self, model_id: str) -> Lock:
+        with acquire_with_timeout(lock=self._state_lock) as acquired:
+            if not acquired:
+                raise ModelManagerLockAcquisitionError(
+                    "Could not acquire lock on Model Manager state to retrieve model lock."
+                )
+            if model_id not in self._models_state_locks:
+                self._models_state_locks[model_id] = Lock()
+            return self._models_state_locks[model_id]
+
+    def _dispose_model_lock(self, model_id: str) -> None:
+        with acquire_with_timeout(lock=self._state_lock) as acquired:
+            if not acquired:
+                raise ModelManagerLockAcquisitionError(
+                    "Could not acquire lock on Model Manager state to dispose model lock."
+                )
+            if model_id not in self._models_state_locks:
+                return None
+            del self._models_state_locks[model_id]
+
+
+@contextmanager
+def acquire_with_timeout(
+    lock: Lock, timeout: float = MODEL_LOCK_ACQUIRE_TIMEOUT
+) -> Generator[bool, None, None]:
+    acquired = lock.acquire(timeout=timeout)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            lock.release()
+
+
+def _get_cuda_memory_allocated() -> Optional[int]:
+    """Return total GPU memory in use (bytes), across all allocators.
+
+    Uses torch.cuda.mem_get_info() which reports device-level free/total,
+    capturing allocations from both PyTorch and other runtimes (e.g. ONNX
+    Runtime's CUDA execution provider).
+    """
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            return total - free
+    except ImportError:
+        pass
+    except Exception:
+        pass
+    return None
+
+
+def try_releasing_cuda_memory() -> None:
+    if not USE_INFERENCE_MODELS:
+        # For now, we only want to have purge CUDA memory when USE_INFERENCE_MODELS is True
+        return None
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+    except Exception as error:
+        logger.warning(f"Attempted to purge CUDA memory but failed with error: {error}")

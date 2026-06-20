@@ -1,0 +1,191 @@
+# We have a duplicate in inference.models.aliases - please maintain both (to have aliasing work in both libraries)
+
+YOLOV11_ALIASES = {
+    "yolov11n-seg-640": "coco-dataset-vdnr1/19",
+    "yolov11s-seg-640": "coco-dataset-vdnr1/20",
+    "yolov11m-seg-640": "coco-dataset-vdnr1/21",
+    "yolov11l-seg-640": "coco-dataset-vdnr1/22",
+    "yolov11x-seg-640": "coco-dataset-vdnr1/23",
+    "yolov11n-640": "coco/25",
+    "yolov11s-640": "coco/26",
+    "yolov11m-640": "coco/27",
+    "yolov11l-640": "coco/28",
+    "yolov11x-640": "coco/29",
+    "yolov11n-1280": "coco/30",
+    "yolov11s-1280": "coco/31",
+    "yolov11m-1280": "coco/32",
+    "yolov11l-1280": "coco/33",
+    "yolov11x-1280": "coco/34",
+}
+YOLOV11_ALIASES = {
+    **YOLOV11_ALIASES,
+    **{k.replace("yolov11", "yolo11"): v for k, v in YOLOV11_ALIASES.items()},
+}
+YOLO26_ALIASES = {
+    "yolov26n-640": "coco/41",
+    "yolov26s-640": "coco/42",
+    "yolov26m-640": "coco/43",
+    "yolov26l-640": "coco/44",
+    "yolov26x-640": "coco/45",
+    "yolo26n-640": "coco/41",
+    "yolo26s-640": "coco/42",
+    "yolo26m-640": "coco/43",
+    "yolo26l-640": "coco/44",
+    "yolo26x-640": "coco/45",
+}
+
+YOLO26_SEG_ALIASES = {
+    "yolov26n-seg-640": "coco-dataset-vdnr1/27",
+    "yolov26s-seg-640": "coco-dataset-vdnr1/28",
+    "yolov26m-seg-640": "coco-dataset-vdnr1/29",
+    "yolov26l-seg-640": "coco-dataset-vdnr1/31",
+    "yolov26x-seg-640": "coco-dataset-vdnr1/34",
+    "yolo26n-seg-640": "coco-dataset-vdnr1/27",
+    "yolo26s-seg-640": "coco-dataset-vdnr1/28",
+    "yolo26m-seg-640": "coco-dataset-vdnr1/29",
+    "yolo26l-seg-640": "coco-dataset-vdnr1/31",
+    "yolo26x-seg-640": "coco-dataset-vdnr1/34",
+}
+
+YOLO26_POSE_ALIASES = {
+    "yolov26n-pose-640": "coco-pose-detection/12",
+    "yolov26s-pose-640": "coco-pose-detection/13",
+    "yolov26m-pose-640": "coco-pose-detection/14",
+    "yolov26l-pose-640": "coco-pose-detection/15",
+    "yolov26x-pose-640": "coco-pose-detection/16",
+    "yolo26n-pose-640": "coco-pose-detection/12",
+    "yolo26s-pose-640": "coco-pose-detection/13",
+    "yolo26m-pose-640": "coco-pose-detection/14",
+    "yolo26l-pose-640": "coco-pose-detection/15",
+    "yolo26x-pose-640": "coco-pose-detection/16",
+}
+
+RFDETR_ALIASES = {
+    "rfdetr-base": "coco/36",
+    # "rfdetr-large": "coco/37", deprecated
+    "rfdetr-nano": "coco/38",
+    "rfdetr-small": "coco/39",
+    "rfdetr-medium": "coco/40",
+    "rfdetr-large": "coco/50",
+    "rfdetr-xlarge": "coco/47",
+    "rfdetr-2xlarge": "coco/48",
+    "rfdetr-seg-preview": "coco-dataset-vdnr1/26",
+    "rfdetr-seg-nano": "coco-dataset-vdnr1/41",
+    "rfdetr-seg-small": "coco-dataset-vdnr1/36",
+    "rfdetr-seg-medium": "coco-dataset-vdnr1/37",
+    "rfdetr-seg-large": "coco-dataset-vdnr1/38",
+    "rfdetr-seg-xlarge": "coco-dataset-vdnr1/39",
+    "rfdetr-seg-2xlarge": "coco-dataset-vdnr1/40",
+}
+
+QWEN_ALIASES = {
+    "qwen25-vl-7b": "qwen-pretrains/1",
+    "qwen3vl-2b-instruct": "qwen-pretrains/2",
+}
+
+CLASSIFICATION_ALIASES = {
+    "resnet18": "classifiers/1",
+    "resnet34": "classifiers/2",
+    "resnet50": "classifiers/3",
+    "resnet101": "classifiers/4",
+}
+
+REGISTERED_ALIASES = {
+    "yolov8n-640": "coco/3",
+    "yolov8n-1280": "coco/9",
+    "yolov8s-640": "coco/6",
+    "yolov8s-1280": "coco/10",
+    "yolov8m-640": "coco/8",
+    "yolov8m-1280": "coco/11",
+    "yolov8l-640": "coco/7",
+    "yolov8l-1280": "coco/12",
+    "yolov8x-640": "coco/5",
+    "yolov8x-1280": "coco/13",
+    "yolo-nas-s-640": "coco/14",
+    "yolo-nas-m-640": "coco/15",
+    "yolo-nas-l-640": "coco/16",
+    "yolov8n-seg-640": "coco-dataset-vdnr1/2",
+    "yolov8n-seg-1280": "coco-dataset-vdnr1/7",
+    "yolov8s-seg-640": "coco-dataset-vdnr1/4",
+    "yolov8s-seg-1280": "coco-dataset-vdnr1/8",
+    "yolov8m-seg-640": "coco-dataset-vdnr1/5",
+    "yolov8m-seg-1280": "coco-dataset-vdnr1/9",
+    "yolov8l-seg-640": "coco-dataset-vdnr1/6",
+    "yolov8l-seg-1280": "coco-dataset-vdnr1/10",
+    "yolov8x-seg-640": "coco-dataset-vdnr1/3",
+    "yolov8x-seg-1280": "coco-dataset-vdnr1/11",
+    "yolov8n-pose-640": "coco-pose-detection/1",
+    "yolov8s-pose-640": "coco-pose-detection/2",
+    "yolov8m-pose-640": "coco-pose-detection/3",
+    "yolov8l-pose-640": "coco-pose-detection/4",
+    "yolov8x-pose-640": "coco-pose-detection/5",
+    "yolov8x-pose-1280": "coco-pose-detection/6",
+    "yolov10n-640": "coco/19",
+    "yolov10s-640": "coco/20",
+    "yolov10m-640": "coco/21",
+    "yolov10b-640": "coco/22",
+    "yolov10l-640": "coco/23",
+    "yolov10x-640": "coco/24",
+    "paligemma-3b-mix-224": "paligemma-pretrains/1",
+    "paligemma-3b-mix-448": "paligemma-pretrains/20",
+    "paligemma-3b-ft-cococap-224": "paligemma-pretrains/8",
+    "paligemma-3b-ft-screen2words-224": "paligemma-pretrains/9",
+    "paligemma-3b-ft-vqav2-224": "paligemma-pretrains/10",
+    "paligemma-3b-ft-tallyqa-224": "paligemma-pretrains/11",
+    "paligemma-3b-ft-docvqa-224": "paligemma-pretrains/12",
+    "paligemma-3b-ft-ocrvqa-224": "paligemma-pretrains/13",
+    "paligemma-3b-ft-cococap-448": "paligemma-pretrains/14",
+    "paligemma-3b-ft-screen2words-448": "paligemma-pretrains/15",
+    "paligemma-3b-ft-vqav2-448": "paligemma-pretrains/16",
+    "paligemma-3b-ft-tallyqa-448": "paligemma-pretrains/17",
+    "paligemma-3b-ft-docvqa-448": "paligemma-pretrains/18",
+    "paligemma-3b-ft-ocrvqa-448": "paligemma-pretrains/19",
+    # "florence-2-base": "florence-pretrains/1",
+    # "florence-2-large": "florence-pretrains/2",
+    # since transformers 0.53.3 need newer version of florence2 weights
+    "florence-2-base": "florence-pretrains/3",
+    "florence-2-large": "florence-pretrains/4",
+    **YOLOV11_ALIASES,
+    **QWEN_ALIASES,
+    **RFDETR_ALIASES,
+    **CLASSIFICATION_ALIASES,
+    **YOLO26_ALIASES,
+    **YOLO26_SEG_ALIASES,
+    **YOLO26_POSE_ALIASES,
+    **YOLO26_ALIASES,
+    **YOLO26_SEG_ALIASES,
+    **YOLO26_POSE_ALIASES,
+}
+
+OCR_ENDPOINTS = {
+    "doctr": "/doctr/ocr",
+    "trocr": "/ocr/trocr",
+    "easy_ocr": "/easy_ocr/ocr",
+}
+
+
+def resolve_roboflow_model_alias(model_id: str) -> str:
+    """Resolve a Roboflow model alias to a registered model ID.
+
+    Args:
+        model_id: The model alias to resolve.
+
+    Returns:
+        The registered model ID.
+    """
+    return REGISTERED_ALIASES.get(model_id, model_id)
+
+
+def resolve_ocr_path(model_name: str) -> str:
+    """Resolve an OCR model name to its corresponding endpoint path.
+
+    Args:
+        model_name: The name of the OCR model.
+
+    Returns:
+        The endpoint path for the OCR model.
+    """
+    model_name = model_name.lower()
+    if model_name not in OCR_ENDPOINTS:
+        raise ValueError(f"OCR not supported: {model_name}")
+    return OCR_ENDPOINTS[model_name]

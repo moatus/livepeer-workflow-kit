@@ -1,0 +1,3 @@
+display_name: Livepeer Workflow Construction
+short_description: Compose Livepeer media workflows from raw blocks and run authored workflow JSON.
+default_prompt: Use this skill to design a Livepeer media workflow from the requested inputs and outputs, compose the needed blocks, run the authored workflow, and report artifacts.
